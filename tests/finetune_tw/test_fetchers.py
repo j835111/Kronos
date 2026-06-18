@@ -96,3 +96,23 @@ def test_twse_fetch_month_returns_none_on_bad_stat():
         mock_get.return_value.json.return_value = {"stat": "查無資料"}
         result = fetch_month("9999", 2024, 1)
     assert result is None
+
+
+from finetune_tw.fetchers.finmind_fetcher import fetch_symbol_finmind
+
+FINMIND_RESPONSE = {
+    "msg": "success",
+    "data": [
+        {"date": "2024-01-02", "open": 580.0, "max": 585.0,
+         "min": 578.0, "close": 582.0, "Trading_Volume": 10000, "Trading_money": 5800000},
+    ],
+}
+
+
+def test_finmind_returns_standard_columns():
+    with patch("finetune_tw.fetchers.finmind_fetcher.requests.get") as mock_get:
+        mock_get.return_value.json.return_value = FINMIND_RESPONSE
+        mock_get.return_value.raise_for_status = MagicMock()
+        df = fetch_symbol_finmind("2330", "2024-01-01", "2024-01-31", token="test_token")
+    assert df is not None
+    assert list(df.columns) == ["date", "open", "high", "low", "close", "volume", "amount"]
