@@ -60,3 +60,39 @@ def test_get_twse_symbol_list_parses_response():
         symbols = get_twse_symbol_list()
     assert "2330.TW" in symbols
     assert "2317.TW" in symbols
+
+
+from finetune_tw.fetchers.twse_scraper import fetch_month, fetch_symbol_twse
+
+TWSE_SAMPLE_RESPONSE = {
+    "stat": "OK",
+    "data": [
+        ["113/01/02", "10,000", "1,000,000", "580.00", "585.00", "578.00", "582.00", "2.00", "100"],
+        ["113/01/03", "12,000", "1,200,000", "582.00", "588.00", "580.00", "586.00", "4.00", "120"],
+    ],
+}
+
+
+def test_twse_fetch_month_standard_columns():
+    with patch("finetune_tw.fetchers.twse_scraper.requests.get") as mock_get:
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = TWSE_SAMPLE_RESPONSE
+        df = fetch_month("2330", 2024, 1)
+    assert df is not None
+    assert list(df.columns) == ["date", "open", "high", "low", "close", "volume", "amount"]
+
+
+def test_twse_fetch_month_roc_date_conversion():
+    with patch("finetune_tw.fetchers.twse_scraper.requests.get") as mock_get:
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = TWSE_SAMPLE_RESPONSE
+        df = fetch_month("2330", 2024, 1)
+    assert df["date"].iloc[0] == "2024-01-02"
+
+
+def test_twse_fetch_month_returns_none_on_bad_stat():
+    with patch("finetune_tw.fetchers.twse_scraper.requests.get") as mock_get:
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {"stat": "查無資料"}
+        result = fetch_month("9999", 2024, 1)
+    assert result is None
