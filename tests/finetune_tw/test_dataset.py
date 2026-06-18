@@ -73,3 +73,29 @@ def test_dataset_skips_short_stocks(tmp_path):
     upsert_prices(db, "TINY.TW", _make_stock_df(5))
     ds = MultiStockDataset(db, LOOKBACK, PRED, "2020-01-01", "2020-12-31")
     assert len(ds) == 0
+
+
+def test_tokenizer_train_one_step(populated_db, tmp_path, monkeypatch):
+    """Verify that train_tokenizer runs one gradient step without crashing."""
+    monkeypatch.syspath_prepend(str(tmp_path))
+    from finetune_tw.config import Config
+    from finetune_tw.train_tokenizer import run_training
+
+    cfg = Config(
+        db_path=populated_db,
+        lookback_window=10,
+        predict_window=5,
+        train_end_date="2020-06-30",
+        val_end_date="2020-12-31",
+        tokenizer_epochs=1,
+        batch_size=2,
+        save_steps=9999,
+        log_interval=1,
+        output_dir=str(tmp_path / "outputs"),
+        pretrained_tokenizer="NeoQuasar/Kronos-Tokenizer-base",
+    )
+    # Only runs if GPU available; skip otherwise
+    import torch
+    if not torch.cuda.is_available():
+        pytest.skip("no GPU")
+    run_training(cfg, max_steps=1)
