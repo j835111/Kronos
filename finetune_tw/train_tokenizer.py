@@ -3,7 +3,6 @@ python finetune_tw/train_tokenizer.py --config finetune_tw/configs/config_tw_dai
 """
 from __future__ import annotations
 import argparse
-import os
 from pathlib import Path
 
 import torch
