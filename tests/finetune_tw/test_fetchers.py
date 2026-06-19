@@ -30,12 +30,13 @@ def test_fetch_symbol_date_format():
     assert df["date"].iloc[0] == "2024-01-01"
 
 
-def test_fetch_symbol_amount_is_zero():
+def test_fetch_symbol_amount_is_turnover_proxy():
     mock_ticker = MagicMock()
     mock_ticker.history.return_value = _mock_history(3)
     with patch("finetune_tw.fetchers.yfinance_fetcher.yf.Ticker", return_value=mock_ticker):
         df = fetch_symbol("2330.TW", start="2024-01-01")
-    assert (df["amount"] == 0.0).all()
+    expected = 1_000_000 * 100.125
+    assert (df["amount"] - expected).abs().max() < 1e-6
 
 
 def test_fetch_symbol_returns_none_on_empty():

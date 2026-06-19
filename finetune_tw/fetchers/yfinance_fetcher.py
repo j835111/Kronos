@@ -26,6 +26,7 @@ def fetch_symbol(
             dates = dates.tz_localize(None)
         date_strs = dates.strftime("%Y-%m-%d")
 
+        avg_price = (hist["Open"] + hist["High"] + hist["Low"] + hist["Close"]) / 4.0
         df = pd.DataFrame({
             "date": date_strs,
             "open": hist["Open"].values,
@@ -33,7 +34,7 @@ def fetch_symbol(
             "low": hist["Low"].values,
             "close": hist["Close"].values,
             "volume": hist["Volume"].values,
-            "amount": 0.0,
+            "amount": (hist["Volume"] * avg_price).values,
         })
         return df.reset_index(drop=True)
     except Exception:
