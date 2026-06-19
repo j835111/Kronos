@@ -7,13 +7,19 @@ import argparse
 from pathlib import Path
 
 import torch
-from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from model import Kronos, KronosTokenizer
 from finetune_tw.config import Config
 from finetune_tw.dataset import MultiStockDataset
 from finetune_tw.train_tokenizer import _load_latest_checkpoint, _save_checkpoint
+
+
+def _resolve_amp(amp_dtype: str) -> tuple[bool, "torch.dtype | None"]:
+    """Map config amp_dtype to (autocast_enabled, dtype). Only bf16 is supported."""
+    if amp_dtype == "bf16":
+        return True, torch.bfloat16
+    return False, None
 
 
 def run_training(cfg: Config, max_steps: int = -1) -> None:
@@ -53,9 +59,7 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
         steps_per_epoch=len(train_loader), epochs=cfg.basemodel_epochs,
         pct_start=0.03, div_factor=10,
     )
-    scaler = GradScaler()
-
-    start_epoch, global_step = _load_latest_checkpoint(ckpt_dir, model, optimizer, scheduler, scaler)
+    start_epoch, global_step = _load_latest_checkpoint(ckpt_dir, model, optimizer, scheduler)
     best_val_loss = float("inf")
     log_path = save_dir / "train_log.csv"
     if not log_path.exists():
@@ -73,16 +77,13 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
             token_in  = [token_s1[:, :-1], token_s2[:, :-1]]
             token_out = [token_s1[:, 1:],  token_s2[:, 1:]]
 
-            with autocast():
-                logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+            logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
+            loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
 
             optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 3.0)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             scheduler.step()
             global_step += 1
 
@@ -90,7 +91,7 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
                 print(f"[epoch {epoch+1} step {global_step}] loss={loss.item():.4f}")
 
             if global_step % cfg.save_steps == 0:
-                _save_checkpoint(ckpt_dir, global_step, epoch, model, optimizer, scheduler, scaler)
+                _save_checkpoint(ckpt_dir, global_step, epoch, model, optimizer, scheduler)
 
             if max_steps > 0 and global_step >= max_steps:
                 return
@@ -112,12 +113,11 @@ def _validate_predictor(model, tokenizer, loader, device) -> float:
         for batch_x, batch_x_stamp in loader:
             batch_x       = batch_x.to(device)
             batch_x_stamp = batch_x_stamp.to(device)
-            with autocast():
-                token_s1, token_s2 = tokenizer.encode(batch_x, half=True)
-                token_in  = [token_s1[:, :-1], token_s2[:, :-1]]
-                token_out = [token_s1[:, 1:],  token_s2[:, 1:]]
-                logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+            token_s1, token_s2 = tokenizer.encode(batch_x, half=True)
+            token_in  = [token_s1[:, :-1], token_s2[:, :-1]]
+            token_out = [token_s1[:, 1:],  token_s2[:, 1:]]
+            logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
+            loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
             total += loss.item() * batch_x.size(0)
             count += batch_x.size(0)
     return total / count if count else 0.0

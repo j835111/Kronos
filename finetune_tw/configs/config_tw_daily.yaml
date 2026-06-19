@@ -1,5 +1,5 @@
 # Reference config for TWSE daily fine-tuning
-db_path: "finetune_tw/data/tw_stocks.db"
+db_path: "/home/james/kronos_data/tw_stocks.db"
 lookback_window: 90
 predict_window: 10
 max_context: 512
@@ -18,6 +18,7 @@ adam_beta1: 0.9
 adam_beta2: 0.95
 adam_weight_decay: 0.1
 num_workers: 2
+amp_dtype: "bf16"
 seed: 42
 
 pretrained_tokenizer: "NeoQuasar/Kronos-Tokenizer-base"

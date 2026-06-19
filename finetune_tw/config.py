@@ -25,6 +25,7 @@ class Config:
     adam_beta2: float = 0.95
     adam_weight_decay: float = 0.1
     num_workers: int = 2
+    amp_dtype: str = "bf16"
     seed: int = 42
 
     # Model paths
