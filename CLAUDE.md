@@ -46,12 +46,12 @@ python finetune/qlib_test.py --device cuda:0
 
 | 環境 | Config | AMP |
 |------|--------|-----|
-| 本機 RTX Pro 6000 (96 GB) | `config_tw_daily_rtx6000.yaml` | bf16 |
+| MoLab RTX Pro 6000 (96 GB) | `config_tw_daily_rtx6000.yaml` | bf16 |
 | Colab T4 (16 GB) | `config_tw_daily_t4.yaml` | fp16 + GradScaler |
 | 其他 / 安全預設 | `config_tw_daily.yaml` | 關閉 |
 
 ```bash
-# 本機訓練（RTX Pro 6000）
+# MoLab 訓練（RTX Pro 6000）
 CONFIG=finetune_tw/configs/config_tw_daily_rtx6000.yaml
 
 # Colab T4
@@ -85,7 +85,7 @@ python -m finetune_tw.backtest --config $CONFIG
 6. **訓練 predictor** — `python -m finetune_tw.train_predictor --config finetune_tw/configs/config_tw_daily_t4.yaml`（支援 resume，重啟 session 後重跑即可）
 7. **回測** — `python -m finetune_tw.backtest --config finetune_tw/configs/config_tw_daily_t4.yaml`
 
-> **注意**：Colab T4 使用 `config_tw_daily_t4.yaml`（`amp_dtype: "fp16"`，Turing 原生 fp16 TensorCore + GradScaler）；本機 RTX Pro 6000 改用 `config_tw_daily_rtx6000.yaml`（bf16 啟用）。Kronos-base pretrained 權重從 `NeoQuasar/Kronos-base` 自動下載。
+> **注意**：Colab T4 使用 `config_tw_daily_t4.yaml`（`amp_dtype: "fp16"`，Turing 原生 fp16 TensorCore + GradScaler）；MoLab RTX Pro 6000 改用 `config_tw_daily_rtx6000.yaml`（bf16 啟用）。Kronos-base pretrained 權重從 `NeoQuasar/Kronos-base` 自動下載。
 
 ## Iterative Improvement Loop (autoresearch + Colab)
 
