@@ -26,6 +26,7 @@ class MultiStockDataset(Dataset):
         seed: int = 42,
     ) -> None:
         self.window = lookback_window + predict_window + 1
+        self.lookback_window = lookback_window
         self.clip = clip
         self.seed = seed
 
@@ -53,8 +54,9 @@ class MultiStockDataset(Dataset):
         x = self._data[sym][start : start + self.window].copy()
         s = self._stamps[sym][start : start + self.window].copy()
 
-        mean = x.mean(axis=0)
-        std = x.std(axis=0) + 1e-5
+        past = x[: self.lookback_window]
+        mean = past.mean(axis=0)
+        std = past.std(axis=0) + 1e-5
         x = np.clip((x - mean) / std, -self.clip, self.clip)
 
         return torch.from_numpy(x), torch.from_numpy(s)

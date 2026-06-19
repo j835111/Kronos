@@ -99,3 +99,29 @@ def test_tokenizer_train_one_step(populated_db, tmp_path, monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("no GPU")
     run_training(cfg, max_steps=1)
+
+
+def test_dataset_normalization_excludes_predict_window(tmp_path):
+    """正規化統計只能來自 lookback 段；預測期的極端值不得影響 mean/std。"""
+    db = str(tmp_path / "leak.db")
+    init_db(db)
+    n = WINDOW
+    rng = np.random.default_rng(0)
+    close = np.concatenate([
+        rng.uniform(100, 120, LOOKBACK),
+        np.full(PRED + 1, 1e6),
+    ])
+    df = pd.DataFrame({
+        "date": pd.bdate_range("2020-01-01", periods=n).strftime("%Y-%m-%d"),
+        "open": close,
+        "high": close + 1,
+        "low": close - 1,
+        "close": close,
+        "volume": np.full(n, 1e6),
+        "amount": np.zeros(n),
+    })
+    upsert_prices(db, "LEAK.TW", df)
+    ds = MultiStockDataset(db, LOOKBACK, PRED, "2020-01-01", "2020-12-31")
+    x, _ = ds[0]
+    lookback_close = x.numpy()[:LOOKBACK, 3]
+    assert abs(float(lookback_close.mean())) < 0.5
