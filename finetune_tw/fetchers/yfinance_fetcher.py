@@ -1,0 +1,40 @@
+from __future__ import annotations
+import requests
+import pandas as pd
+import yfinance as yf
+
+TWSE_LISTING_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL"
+
+
+def get_twse_symbol_list() -> list[str]:
+    resp = requests.get(TWSE_LISTING_URL, timeout=15)
+    resp.raise_for_status()
+    return [f"{item['Code']}.TW" for item in resp.json() if item.get("Code")]
+
+
+def fetch_symbol(
+    symbol: str, start: str = "2015-01-01", end: str | None = None
+) -> pd.DataFrame | None:
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(start=start, end=end, auto_adjust=True)
+        if hist.empty:
+            return None
+        # Extract date from index regardless of its name
+        dates = pd.to_datetime(hist.index)
+        if dates.tz is not None:
+            dates = dates.tz_localize(None)
+        date_strs = dates.strftime("%Y-%m-%d")
+
+        df = pd.DataFrame({
+            "date": date_strs,
+            "open": hist["Open"].values,
+            "high": hist["High"].values,
+            "low": hist["Low"].values,
+            "close": hist["Close"].values,
+            "volume": hist["Volume"].values,
+            "amount": 0.0,
+        })
+        return df.reset_index(drop=True)
+    except Exception:
+        return None
