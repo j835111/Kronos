@@ -417,36 +417,6 @@ class _Cfg:
     val_ic_horizons = 5
 
 
-def _make_fns(skill: float):
-    """Build fake ctx/predict/actual where predicted ranking matches actual by `skill`."""
-    # 4 symbols, deterministic actual future returns; pred = actual*skill + noise-free order
-    actual_paths = {
-        "A": [101, 102, 103, 104, 105],   # +ve
-        "B": [100, 99, 98, 97, 96],       # -ve
-        "C": [100, 100.5, 101, 101.5, 102],
-        "D": [100, 99.5, 99, 98.5, 98],
-    }
-    ctx_close = 100.0
-
-    def build_ctx(sym, date):
-        df = pd.DataFrame({"open": [100]*3, "high": [100]*3, "low": [100]*3,
-                           "close": [100, 100, ctx_close], "volume": [1]*3, "amount": [1]*3})
-        return df, pd.Series(pd.bdate_range("2024-01-01", periods=3)), \
-               pd.Series(pd.bdate_range(date, periods=5)), pd.Timestamp(date), ctx_close
-
-    def predict_batch(df_list, x_timestamp_list, y_timestamp_list, pred_len):
-        out = []
-        for yts in y_timestamp_list:
-            # caller passes symbols in fixed order; we encode skill via index mapping below
-            out.append(None)
-        return out  # replaced per-symbol below; see note
-
-    def actual_lookup(sym, ctx_last_date, n):
-        return np.array(actual_paths[sym][:n], dtype=float)
-
-    return build_ctx, predict_batch, actual_lookup, list(actual_paths.keys())
-
-
 def test_validate_predictor_ic_perfect_skill_returns_high_ic():
     # Fake predictor that returns the true future path -> IC should be ~1.0
     actual_paths = {
