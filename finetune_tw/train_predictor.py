@@ -8,6 +8,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import torch
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
@@ -15,6 +17,13 @@ from torch.utils.data import DataLoader
 from model import Kronos, KronosTokenizer
 from finetune_tw.config import Config
 from finetune_tw.dataset import MultiStockDataset
+from finetune_tw.db import list_symbols, query_symbol
+from finetune_tw.ic_validation import (
+    EarlyStopper,
+    pick_val_dates,
+    pick_val_universe,
+    validate_predictor_ic,
+)
 from finetune_tw.train_tokenizer import _load_latest_checkpoint, _save_checkpoint
 
 
@@ -28,6 +37,17 @@ def _gdrive_sync(local_dir: Path, remote: str = "gdrive:Kronos/outputs") -> None
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     print(f"  [gdrive] sync started (background) → {remote}/{rel}")
+
+
+def _gdrive_sync_logs(log_path: Path, remote: str) -> None:
+    """Upload train_log.csv to Drive (fixes the lost-log gap)."""
+    if shutil.which("rclone") is None or not log_path.exists():
+        return
+    subprocess.Popen(
+        ["rclone", "copy", str(log_path), remote],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def _gdrive_restore_checkpoints(ckpt_dir: Path, remote: str) -> None:
@@ -61,6 +81,47 @@ def _resolve_amp(amp_dtype: str) -> tuple[bool, "torch.dtype | None"]:
     if amp_dtype == "fp16":
         return True, torch.float16
     return False, None
+
+
+def _build_ctx_for_date(cfg, sym, rebal_date):
+    rebal_str = rebal_date.strftime("%Y-%m-%d")
+    lookback_start = (rebal_date - pd.Timedelta(days=cfg.lookback_window * 2)).strftime("%Y-%m-%d")
+    df = query_symbol(cfg.db_path, sym, start=lookback_start, end=rebal_str)
+    if len(df) < cfg.lookback_window:
+        return None
+    ctx = df.iloc[-cfg.lookback_window:]
+    ctx_df = ctx[["open", "high", "low", "close", "volume", "amount"]].reset_index(drop=True)
+    if ctx_df.isnull().any().any():
+        return None
+    x_ts = pd.to_datetime(ctx["date"]).reset_index(drop=True)
+    y_ts = pd.Series(pd.date_range(rebal_date, periods=cfg.pred_len, freq="B"))
+    return ctx_df, x_ts, y_ts, x_ts.iloc[-1], float(ctx_df["close"].iloc[-1])
+
+
+def _actual_close_lookup(cfg, cache, sym, ctx_last_date, n):
+    ser = cache.get(sym)
+    if ser is None:
+        return np.array([], dtype=float)
+    pos = ser.index.searchsorted(ctx_last_date, side="right")
+    return ser.iloc[pos:pos + n].values.astype(float)
+
+
+def _make_predict_batch_fn(predictor):
+    def fn(df_list, x_timestamp_list, y_timestamp_list, pred_len):
+        with torch.no_grad():
+            return predictor.predict_batch(
+                df_list=df_list,
+                x_timestamp_list=x_timestamp_list,
+                y_timestamp_list=y_timestamp_list,
+                pred_len=pred_len,
+                T=1.0,
+                top_k=1,
+                top_p=1.0,
+                sample_count=1,
+                verbose=False,
+            )
+
+    return fn
 
 
 def run_training(cfg: Config, max_steps: int = -1) -> None:
@@ -106,10 +167,22 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
     )
     _gdrive_restore_checkpoints(ckpt_dir, f"{remote_root}/checkpoints")
     start_epoch, global_step = _load_latest_checkpoint(ckpt_dir, model, optimizer, scheduler)
-    best_val_loss = float("inf")
     log_path = save_dir / "train_log.csv"
     if not log_path.exists():
-        log_path.write_text("epoch,step,train_loss,val_loss\n")
+        log_path.write_text("epoch,step,train_loss,val_loss,val_ic\n")
+
+    from model import KronosPredictor
+    predictor = KronosPredictor(model, tokenizer, device=device, max_context=cfg.max_context)
+    all_syms = [s for s in list_symbols(cfg.db_path) if s != cfg.benchmark_symbol]
+    val_universe = pick_val_universe(all_syms, cfg.ic_val_symbols, cfg.seed)
+    val_dates = pick_val_dates(cfg.train_end_date, cfg.val_end_date, cfg.ic_val_dates)
+    buffer_start = (pd.Timestamp(cfg.train_end_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    actual_cache = {}
+    for sym in val_universe:
+        df = query_symbol(cfg.db_path, sym, start=buffer_start, end=cfg.val_end_date)
+        if len(df):
+            actual_cache[sym] = pd.Series(df["close"].values, index=pd.DatetimeIndex(df["date"]))
+    stopper = EarlyStopper(patience=cfg.early_stop_patience, mode="max")
 
     for epoch in range(start_epoch, cfg.basemodel_epochs):
         model.train()
@@ -152,14 +225,27 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
                 return
 
         val_loss = _validate_predictor(model, tokenizer, val_loader, device, amp_enabled, amp_dtype)
+        model.eval()
+        val_ic = validate_predictor_ic(
+            _make_predict_batch_fn(predictor),
+            lambda sym, last, n: _actual_close_lookup(cfg, actual_cache, sym, last, n),
+            val_universe,
+            val_dates,
+            cfg,
+            lambda sym, rebal_date: _build_ctx_for_date(cfg, sym, rebal_date),
+        )
         with open(log_path, "a") as f:
-            f.write(f"{epoch+1},{global_step},{loss.item():.4f},{val_loss:.4f}\n")
+            f.write(f"{epoch+1},{global_step},{loss.item():.4f},{val_loss:.4f},{val_ic:.4f}\n")
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        is_best, should_stop = stopper.update(val_ic)
+        if is_best:
             model.save_pretrained(str(save_dir / "best_model"))
-            print(f"  -> new best val_loss={val_loss:.4f}, saved.")
+            print(f"  -> new best val_ic={val_ic:.4f} (val_loss={val_loss:.4f}), saved.")
             _gdrive_sync(save_dir / "best_model", remote=remote_root)
+            _gdrive_sync_logs(log_path, remote_root)
+        if should_stop:
+            print(f"  -> early stop at epoch {epoch+1} (best val_ic={stopper.best:.4f})")
+            break
 
 
 def _validate_predictor(model, tokenizer, loader, device, amp_enabled=False, amp_dtype=None) -> float:
