@@ -159,6 +159,18 @@ def _build_token_cache(
     return paths["data"]
 
 
+def _steps_for_epoch(loader_len: int, step_cap: int) -> int:
+    return min(loader_len, step_cap) if step_cap > 0 else loader_len
+
+
+def _configure_cuda_runtime(device: torch.device, enable_tf32: bool) -> None:
+    if device.type != "cuda" or not enable_tf32:
+        return
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+
 def _build_ctx_for_date(cfg, sym, rebal_date):
     rebal_str = rebal_date.strftime("%Y-%m-%d")
     lookback_start = (rebal_date - pd.Timedelta(days=cfg.lookback_window * 2)).strftime("%Y-%m-%d")
@@ -203,6 +215,7 @@ def _make_predict_batch_fn(predictor):
 def run_training(cfg: Config, max_steps: int = -1) -> None:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(cfg.seed)
+    _configure_cuda_runtime(device, cfg.enable_tf32)
 
     tok_path = Path(cfg.output_dir) / cfg.exp_name / "tokenizer" / "best_model"
     if not tok_path.exists():
@@ -228,17 +241,67 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
     val_ds   = MultiStockDataset(cfg.db_path, cfg.lookback_window, cfg.predict_window,
                                  cfg.train_end_date, cfg.val_end_date, cfg.clip, cfg.seed + 1)
 
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
-                              num_workers=cfg.num_workers, pin_memory=True, drop_last=True)
-    val_loader   = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
-                              num_workers=cfg.num_workers, pin_memory=True)
+    train_loader_kwargs = {
+        "num_workers": cfg.num_workers,
+        "pin_memory": True,
+        "drop_last": True,
+    }
+    val_loader_kwargs = {
+        "num_workers": cfg.num_workers,
+        "pin_memory": True,
+    }
+    if cfg.num_workers > 0:
+        train_loader_kwargs["persistent_workers"] = cfg.persistent_workers
+        train_loader_kwargs["prefetch_factor"] = cfg.prefetch_factor
+        val_loader_kwargs["persistent_workers"] = cfg.persistent_workers
+        val_loader_kwargs["prefetch_factor"] = cfg.prefetch_factor
+
+    cache_dir = Path(cfg.output_dir) / cfg.exp_name / "token_cache"
+    if cfg.token_cache_enabled:
+        train_cache = _build_token_cache(
+            train_ds,
+            tokenizer,
+            device,
+            cache_dir,
+            "train",
+            cfg.batch_size,
+            cfg.token_cache_dtype,
+        )
+        val_cache = _build_token_cache(
+            val_ds,
+            tokenizer,
+            device,
+            cache_dir,
+            "val",
+            cfg.batch_size,
+            cfg.token_cache_dtype,
+        )
+        train_loader = DataLoader(
+            CachedTokenDataset(train_cache),
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            **train_loader_kwargs,
+        )
+        val_loader = DataLoader(
+            CachedTokenDataset(val_cache),
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            **val_loader_kwargs,
+        )
+    else:
+        train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
+                                  **train_loader_kwargs)
+        val_loader   = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
+                                  **val_loader_kwargs)
+
+    train_steps_per_epoch = _steps_for_epoch(len(train_loader), cfg.train_steps_per_epoch)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.predictor_lr,
                                   betas=(cfg.adam_beta1, cfg.adam_beta2),
                                   weight_decay=cfg.adam_weight_decay)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=cfg.predictor_lr,
-        steps_per_epoch=len(train_loader), epochs=cfg.basemodel_epochs,
+        steps_per_epoch=train_steps_per_epoch, epochs=cfg.basemodel_epochs,
         pct_start=0.03, div_factor=10,
     )
     _gdrive_restore_checkpoints(ckpt_dir, f"{remote_root}/checkpoints")
@@ -266,21 +329,35 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
 
     for epoch in range(start_epoch, cfg.basemodel_epochs):
         model.train()
-        for batch_x, batch_x_stamp in train_loader:
-            batch_x       = batch_x.to(device, non_blocking=True)
-            batch_x_stamp = batch_x_stamp.to(device, non_blocking=True)
+        steps_this_epoch = train_steps_per_epoch
+        for step_idx, batch in enumerate(train_loader):
+            if step_idx >= steps_this_epoch:
+                break
 
-            with torch.no_grad():
-                token_s1, token_s2 = tokenizer.encode(batch_x, half=True)
+            if cfg.token_cache_enabled:
+                token_s1, token_s2, batch_x_stamp = batch
+                token_s1 = token_s1.to(device=device, dtype=torch.long, non_blocking=True)
+                token_s2 = token_s2.to(device=device, dtype=torch.long, non_blocking=True)
+                batch_x_stamp = batch_x_stamp.to(device, non_blocking=True)
+            else:
+                batch_x, batch_x_stamp = batch
+                batch_x = batch_x.to(device, non_blocking=True)
+                batch_x_stamp = batch_x_stamp.to(device, non_blocking=True)
+                with torch.no_grad():
+                    token_s1, token_s2 = tokenizer.encode(batch_x, half=True)
 
             token_in  = [token_s1[:, :-1], token_s2[:, :-1]]
             token_out = [token_s1[:, 1:],  token_s2[:, 1:]]
 
-            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled):
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype or torch.bfloat16,
+                enabled=amp_enabled,
+            ):
                 logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
                 loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -304,7 +381,16 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
             if max_steps > 0 and global_step >= max_steps:
                 return
 
-        val_loss = _validate_predictor(model, tokenizer, val_loader, device, amp_enabled, amp_dtype)
+        val_loss = _validate_predictor(
+            model,
+            tokenizer,
+            val_loader,
+            device,
+            amp_enabled,
+            amp_dtype,
+            cfg.token_cache_enabled,
+            cfg.val_steps_per_epoch,
+        )
         model.eval()
         val_ic = validate_predictor_ic(
             _make_predict_batch_fn(predictor),
@@ -328,22 +414,46 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
             break
 
 
-def _validate_predictor(model, tokenizer, loader, device, amp_enabled=False, amp_dtype=None) -> float:
+def _validate_predictor(
+    model,
+    tokenizer,
+    loader,
+    device,
+    amp_enabled=False,
+    amp_dtype=None,
+    token_cache_enabled=False,
+    step_cap=0,
+) -> float:
     model.eval()
     amp_enabled = amp_enabled and device.type == "cuda"
     total, count = 0.0, 0
+    val_steps = _steps_for_epoch(len(loader), step_cap)
     with torch.no_grad():
-        for batch_x, batch_x_stamp in loader:
-            batch_x       = batch_x.to(device)
-            batch_x_stamp = batch_x_stamp.to(device)
-            token_s1, token_s2 = tokenizer.encode(batch_x, half=True)
+        for step_idx, batch in enumerate(loader):
+            if step_idx >= val_steps:
+                break
+
+            if token_cache_enabled:
+                token_s1, token_s2, batch_x_stamp = batch
+                token_s1 = token_s1.to(device=device, dtype=torch.long, non_blocking=True)
+                token_s2 = token_s2.to(device=device, dtype=torch.long, non_blocking=True)
+                batch_x_stamp = batch_x_stamp.to(device, non_blocking=True)
+            else:
+                batch_x, batch_x_stamp = batch
+                batch_x = batch_x.to(device, non_blocking=True)
+                batch_x_stamp = batch_x_stamp.to(device, non_blocking=True)
+                token_s1, token_s2 = tokenizer.encode(batch_x, half=True)
             token_in  = [token_s1[:, :-1], token_s2[:, :-1]]
             token_out = [token_s1[:, 1:],  token_s2[:, 1:]]
-            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled):
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype or torch.bfloat16,
+                enabled=amp_enabled,
+            ):
                 logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
                 loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
-            total += loss.item() * batch_x.size(0)
-            count += batch_x.size(0)
+            total += loss.item() * batch_x_stamp.size(0)
+            count += batch_x_stamp.size(0)
     return total / count if count else 0.0
 
 

@@ -4,7 +4,12 @@ from pathlib import Path
 
 from finetune_tw.config import Config
 from finetune_tw.db import init_db, upsert_prices
-from finetune_tw.train_predictor import _build_ctx_for_date, _resolve_amp, _token_cache_paths
+from finetune_tw.train_predictor import (
+    _build_ctx_for_date,
+    _resolve_amp,
+    _steps_for_epoch,
+    _token_cache_paths,
+)
 
 
 def test_config_accepts_training_control_fields():
@@ -105,3 +110,7 @@ def test_token_cache_paths_are_split_specific(tmp_path):
     path = _token_cache_paths(Path(tmp_path), "train")
     assert path["data"].name == "train_token_cache.pt"
     assert path["meta"].name == "train_token_cache_meta.json"
+
+
+def test_predictor_steps_for_epoch_uses_cap():
+    assert _steps_for_epoch(500, 120) == 120
