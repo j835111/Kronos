@@ -52,9 +52,32 @@ def _gdrive_sync_checkpoint(ckpt_path: Path, remote_ckpt_dir: str) -> None:
     )
 
 
+def _resolve_runtime_flags(amp_dtype: str, enable_tf32: bool) -> dict[str, object]:
+    if amp_dtype == "bf16":
+        dtype = torch.bfloat16
+    elif amp_dtype == "fp16":
+        dtype = torch.float16
+    else:
+        dtype = None
+    return {
+        "amp_enabled": dtype is not None,
+        "amp_dtype": dtype,
+        "enable_tf32": enable_tf32,
+    }
+
+
+def _steps_for_epoch(loader_len: int, step_cap: int) -> int:
+    return min(loader_len, step_cap) if step_cap > 0 else loader_len
+
+
 def run_training(cfg: Config, max_steps: int = -1) -> None:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(cfg.seed)
+    runtime = _resolve_runtime_flags(cfg.amp_dtype, cfg.enable_tf32)
+    if device.type == "cuda" and runtime["enable_tf32"]:
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     save_dir = Path(cfg.output_dir) / cfg.exp_name / "tokenizer"
     ckpt_dir = save_dir / "checkpoints"
@@ -68,17 +91,34 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
     val_ds   = MultiStockDataset(cfg.db_path, cfg.lookback_window, cfg.predict_window,
                                  cfg.train_end_date, cfg.val_end_date, cfg.clip, cfg.seed + 1)
 
+    train_loader_kwargs = {
+        "num_workers": cfg.num_workers,
+        "pin_memory": True,
+        "drop_last": True,
+    }
+    val_loader_kwargs = {
+        "num_workers": cfg.num_workers,
+        "pin_memory": True,
+    }
+    if cfg.num_workers > 0:
+        train_loader_kwargs["persistent_workers"] = cfg.persistent_workers
+        train_loader_kwargs["prefetch_factor"] = cfg.prefetch_factor
+        val_loader_kwargs["persistent_workers"] = cfg.persistent_workers
+        val_loader_kwargs["prefetch_factor"] = cfg.prefetch_factor
+
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
-                              num_workers=cfg.num_workers, pin_memory=True, drop_last=True)
+                              **train_loader_kwargs)
     val_loader   = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
-                              num_workers=cfg.num_workers, pin_memory=True)
+                              **val_loader_kwargs)
+
+    train_steps_per_epoch = _steps_for_epoch(len(train_loader), cfg.train_steps_per_epoch)
 
     optimizer = torch.optim.AdamW(tokenizer.parameters(), lr=cfg.tokenizer_lr,
                                   betas=(cfg.adam_beta1, cfg.adam_beta2),
                                   weight_decay=cfg.adam_weight_decay)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=cfg.tokenizer_lr,
-        steps_per_epoch=len(train_loader), epochs=cfg.tokenizer_epochs,
+        steps_per_epoch=train_steps_per_epoch, epochs=cfg.tokenizer_epochs,
         pct_start=0.03, div_factor=10,
     )
     # Resume from latest checkpoint
@@ -91,12 +131,20 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
 
     for epoch in range(start_epoch, cfg.tokenizer_epochs):
         tokenizer.train()
-        for batch_x, _ in train_loader:
+        steps_this_epoch = train_steps_per_epoch
+        for step_idx, (batch_x, _) in enumerate(train_loader):
+            if step_idx >= steps_this_epoch:
+                break
             batch_x = batch_x.to(device, non_blocking=True)
-            (z_pre, z), bsq_loss, _, _ = tokenizer(batch_x)
-            recon_loss = F.mse_loss(z_pre, batch_x) + F.mse_loss(z, batch_x)
-            loss = (recon_loss + bsq_loss) / 2
-            optimizer.zero_grad()
+            with torch.autocast(
+                device_type=device.type,
+                dtype=runtime["amp_dtype"] or torch.bfloat16,
+                enabled=bool(runtime["amp_enabled"] and device.type == "cuda"),
+            ):
+                (z_pre, z), bsq_loss, _, _ = tokenizer(batch_x)
+                recon_loss = F.mse_loss(z_pre, batch_x) + F.mse_loss(z, batch_x)
+                loss = (recon_loss + bsq_loss) / 2
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(tokenizer.parameters(), 3.0)
             optimizer.step()
@@ -113,7 +161,7 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
             if max_steps > 0 and global_step >= max_steps:
                 return
 
-        val_loss = _validate(tokenizer, val_loader, device)
+        val_loss = _validate(tokenizer, val_loader, device, runtime, cfg.val_steps_per_epoch)
         with open(log_path, "a") as f:
             f.write(f"{epoch+1},{global_step},{loss.item():.4f},{val_loss:.4f}\n")
 
@@ -124,13 +172,27 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
             _gdrive_sync(save_dir / "best_model", remote=remote_root)
 
 
-def _validate(tokenizer: KronosTokenizer, loader: DataLoader, device: torch.device) -> float:
+def _validate(
+    tokenizer: KronosTokenizer,
+    loader: DataLoader,
+    device: torch.device,
+    runtime: dict[str, object],
+    step_cap: int,
+) -> float:
     tokenizer.eval()
     total, count = 0.0, 0
+    val_steps = _steps_for_epoch(len(loader), step_cap)
     with torch.no_grad():
-        for batch_x, _ in loader:
-            batch_x = batch_x.to(device)
-            (_, z), _, _, _ = tokenizer(batch_x)
+        for step_idx, (batch_x, _) in enumerate(loader):
+            if step_idx >= val_steps:
+                break
+            batch_x = batch_x.to(device, non_blocking=True)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=runtime["amp_dtype"] or torch.bfloat16,
+                enabled=bool(runtime["amp_enabled"] and device.type == "cuda"),
+            ):
+                (_, z), _, _, _ = tokenizer(batch_x)
             total += F.mse_loss(z, batch_x).item() * batch_x.size(0)
             count += batch_x.size(0)
     return total / count if count else 0.0
