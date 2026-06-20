@@ -33,21 +33,8 @@ from model import Kronos, KronosTokenizer, KronosPredictor
 from finetune_tw.config import Config
 from finetune_tw.db import query_symbol, list_symbols
 from finetune_tw.dataset import MultiStockDataset
+from finetune_tw.ic_validation import rank_ic as _rank_ic
 from finetune_tw.train_predictor import _validate_predictor, _resolve_amp
-
-
-def _rank_ic(pred: np.ndarray, actual: np.ndarray) -> float:
-    """Spearman rank correlation = Pearson on ranks. No scipy dependency."""
-    pred = np.asarray(pred, dtype=float)
-    actual = np.asarray(actual, dtype=float)
-    m = np.isfinite(pred) & np.isfinite(actual)
-    if m.sum() < 3:
-        return np.nan
-    pr = pd.Series(pred[m]).rank().values
-    ar = pd.Series(actual[m]).rank().values
-    if pr.std() < 1e-9 or ar.std() < 1e-9:
-        return np.nan
-    return float(np.corrcoef(pr, ar)[0, 1])
 
 
 def _safe_mean(x):
