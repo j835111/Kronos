@@ -6,6 +6,25 @@ from finetune_tw.db import init_db, upsert_prices
 from finetune_tw.train_predictor import _build_ctx_for_date, _resolve_amp
 
 
+def test_config_accepts_training_control_fields():
+    cfg = Config(
+        train_steps_per_epoch=1000,
+        val_steps_per_epoch=200,
+        persistent_workers=True,
+        prefetch_factor=2,
+        enable_tf32=True,
+        token_cache_enabled=True,
+        token_cache_dtype="uint16",
+    )
+    assert cfg.train_steps_per_epoch == 1000
+    assert cfg.val_steps_per_epoch == 200
+    assert cfg.persistent_workers is True
+    assert cfg.prefetch_factor == 2
+    assert cfg.enable_tf32 is True
+    assert cfg.token_cache_enabled is True
+    assert cfg.token_cache_dtype == "uint16"
+
+
 def test_resolve_amp_bf16():
     enabled, dtype = _resolve_amp("bf16")
     assert enabled is True
