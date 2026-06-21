@@ -1,6 +1,6 @@
-# RTX Pro 6000 (96 GB VRAM) — large batch for bf16 on Blackwell
+# RTX Pro 6000 (96 GB VRAM) — validated conservative defaults for a 4-core MoLab host
 # Usage: python -m finetune_tw.train_tokenizer --config finetune_tw/configs/config_tw_daily_rtx6000.yaml
-db_path: "/home/james/kronos_data/tw_stocks.db"
+db_path: "/mnt/first/data/tw_stocks.db"
 lookback_window: 90
 predict_window: 10
 max_context: 512
