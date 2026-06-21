@@ -6,9 +6,9 @@ Kronos Taiwan Stock Fine-tuning — molab edition
   2. 新建 notebook，點右上角 notebook specs → 啟用 GPU
   3. 執行所有 cell（Run All）
 
-持久化路徑：/mnt/first/
-  data/tw_stocks.db   — 股價 DB（下載一次即可）
-  outputs/            — tokenizer & predictor checkpoint
+所有路徑在 /marimo/Kronos/ 下（與 repo 同根）：
+  finetune_tw/data/tw_stocks.db   — 股價 DB（每次 sandbox 重新下載）
+  finetune_tw/outputs/            — tokenizer & predictor checkpoint
 """
 
 import marimo
@@ -59,8 +59,8 @@ def _setup(mo, os, sys, subprocess, tarfile, Path):
 
 
 @app.cell
-def _download(mo, Path, datetime):
-    DB_DST = "/mnt/first/data/tw_stocks.db"
+def _download(mo, Path, REPO_DIR, datetime):
+    DB_DST = str(Path(REPO_DIR) / "finetune_tw" / "data" / "tw_stocks.db")
     Path(DB_DST).parent.mkdir(parents=True, exist_ok=True)
 
     if not Path(DB_DST).exists():
@@ -86,7 +86,7 @@ def _config(mo, dataclasses, DB_DST):
     cfg = Config.from_yaml("finetune_tw/configs/config_tw_daily.yaml")
     cfg = dataclasses.replace(cfg,
         db_path=DB_DST,
-        output_dir="/mnt/first/outputs",
+        output_dir=str(Path(REPO_DIR) / "finetune_tw" / "outputs"),
         tokenizer_epochs=30,
         basemodel_epochs=20,
         batch_size=128,        # RTX Pro 6000 96GB — 可以比 T4 大很多
