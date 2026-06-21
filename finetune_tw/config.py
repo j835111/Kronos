@@ -39,6 +39,10 @@ class Config:
     exp_name: str = "tw_daily"
     output_dir: str = "finetune_tw/outputs"
 
+    # HuggingFace Hub — version control for fine-tuned weights
+    hf_repo: str = "j835111/kronos-tw-finetune"
+    hf_revision: str = "main"
+
     # Backtest
     top_k: int = 20
     hold_days: int = 5

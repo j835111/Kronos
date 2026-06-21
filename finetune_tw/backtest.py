@@ -1,7 +1,6 @@
 """
 python finetune_tw/backtest.py --config finetune_tw/configs/config_tw_daily.yaml
-Requires: fine-tuned predictor at outputs/{exp_name}/predictor/best_model/
-          fine-tuned tokenizer at outputs/{exp_name}/tokenizer/best_model/
+Loads fine-tuned weights from local path or HuggingFace Hub (cfg.hf_repo / cfg.hf_revision).
 """
 from __future__ import annotations
 import argparse
@@ -17,6 +16,7 @@ import matplotlib.pyplot as plt
 from model import Kronos, KronosTokenizer, KronosPredictor
 from finetune_tw.config import Config
 from finetune_tw.db import query_symbol, list_symbols
+from finetune_tw.hf_utils import resolve_src
 
 
 # ── Pure helper functions (testable without a model) ────────────────────────
@@ -88,11 +88,14 @@ def build_portfolio_returns(
 def run_backtest(cfg: Config) -> None:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    tok_path  = Path(cfg.output_dir) / cfg.exp_name / "tokenizer" / "best_model"
-    pred_path = Path(cfg.output_dir) / cfg.exp_name / "predictor" / "best_model"
+    exp_dir   = Path(cfg.output_dir) / cfg.exp_name
+    tok_path  = exp_dir / "tokenizer" / "best_model"
+    pred_path = exp_dir / "predictor" / "best_model"
 
-    tokenizer = KronosTokenizer.from_pretrained(str(tok_path))
-    model     = Kronos.from_pretrained(str(pred_path))
+    tok_src,  tok_kw  = resolve_src(tok_path,  cfg.hf_repo, "tokenizer/best_model",  cfg.hf_revision)
+    pred_src, pred_kw = resolve_src(pred_path, cfg.hf_repo, "predictor/best_model", cfg.hf_revision)
+    tokenizer = KronosTokenizer.from_pretrained(tok_src,  **tok_kw)
+    model     = Kronos.from_pretrained(pred_src, **pred_kw)
     predictor = KronosPredictor(model, tokenizer, device=device, max_context=cfg.max_context)
     tokenizer.eval(); model.eval()
 

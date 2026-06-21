@@ -33,6 +33,7 @@ from model import Kronos, KronosTokenizer, KronosPredictor
 from finetune_tw.config import Config
 from finetune_tw.db import query_symbol, list_symbols
 from finetune_tw.dataset import MultiStockDataset
+from finetune_tw.hf_utils import resolve_src
 from finetune_tw.ic_validation import rank_ic as _rank_ic
 from finetune_tw.train_predictor import _validate_predictor, _resolve_amp
 
@@ -85,17 +86,20 @@ def run_eval(cfg, smoke: bool = False, fidelity_symbols: int = 12,
              baseline: bool = False) -> dict:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if baseline:
-        # Control group: un-fine-tuned pretrained Kronos straight from HuggingFace.
-        tok_src, pred_src = cfg.pretrained_tokenizer, cfg.pretrained_predictor
+        tok_src, tok_kw   = cfg.pretrained_tokenizer, {}
+        pred_src, pred_kw = cfg.pretrained_predictor, {}
         tag = "baseline"
     else:
-        tok_src = str(Path(cfg.output_dir) / cfg.exp_name / "tokenizer" / "best_model")
-        pred_src = str(Path(cfg.output_dir) / cfg.exp_name / "predictor" / "best_model")
+        exp_dir   = Path(cfg.output_dir) / cfg.exp_name
+        tok_src,  tok_kw  = resolve_src(exp_dir / "tokenizer" / "best_model",
+                                        cfg.hf_repo, "tokenizer/best_model", cfg.hf_revision)
+        pred_src, pred_kw = resolve_src(exp_dir / "predictor" / "best_model",
+                                        cfg.hf_repo, "predictor/best_model", cfg.hf_revision)
         tag = "finetuned"
     print(f"loading {tag}: tokenizer={tok_src} predictor={pred_src}", flush=True)
 
-    tokenizer = KronosTokenizer.from_pretrained(tok_src).to(device)
-    model = Kronos.from_pretrained(pred_src).to(device)
+    tokenizer = KronosTokenizer.from_pretrained(tok_src, **tok_kw).to(device)
+    model = Kronos.from_pretrained(pred_src, **pred_kw).to(device)
     predictor = KronosPredictor(model, tokenizer, device=device, max_context=cfg.max_context)
     tokenizer.eval(); model.eval()
 
