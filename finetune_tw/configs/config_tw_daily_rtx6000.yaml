@@ -9,12 +9,12 @@ train_end_date: "2023-12-31"
 val_end_date: "2024-06-30"
 
 tokenizer_epochs: 12
-basemodel_epochs: 10
+basemodel_epochs: 20
 batch_size: 384
 save_steps: 2000
 log_interval: 50
 tokenizer_lr: 0.0002
-predictor_lr: 0.00004
+predictor_lr: 0.00005
 adam_beta1: 0.9
 adam_beta2: 0.95
 adam_weight_decay: 0.1
@@ -29,13 +29,20 @@ token_cache_enabled: true
 token_cache_dtype: "uint16"
 seed: 42
 
+early_stop_patience: 3
+ic_val_symbols: 300
+ic_val_dates: 20
+
 pretrained_tokenizer: "NeoQuasar/Kronos-Tokenizer-base"
-pretrained_predictor: "NeoQuasar/Kronos-base"
+pretrained_predictor: "j835111/kronos-tw-finetune"
+hf_revision: "round-0"
+hf_repo: "j835111/kronos-tw-finetune"
+hf_revision_out: "round-2"
 exp_name: "tw_daily"
 output_dir: "/marimo/Kronos/finetune_tw/outputs"
 
-top_k: 20
-hold_days: 5
+top_k: 10
+hold_days: 3
 pred_len: 10
 test_start_date: "2024-07-01"
 benchmark_symbol: "^TWII"

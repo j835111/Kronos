@@ -5,6 +5,7 @@ Requires: tokenizer best_model saved by train_tokenizer.py
 from __future__ import annotations
 import argparse
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -24,7 +25,9 @@ from finetune_tw.ic_validation import (
     pick_val_dates,
     pick_val_universe,
     validate_predictor_ic,
+    validate_predictor_ic_ir,
 )
+from finetune_tw.hf_utils import push_best_model, push_file, wait_for_pushes
 from finetune_tw.train_tokenizer import _load_latest_checkpoint, _save_checkpoint
 
 
@@ -226,7 +229,20 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
     for p in tokenizer.parameters():
         p.requires_grad_(False)
 
-    model = Kronos.from_pretrained(cfg.pretrained_predictor).to(device)
+    if cfg.hf_revision:
+        from huggingface_hub import snapshot_download
+        _snap = snapshot_download(
+            cfg.pretrained_predictor,
+            revision=cfg.hf_revision,
+            allow_patterns=["predictor/best_model/*"],
+            token=os.environ.get("HF_TOKEN"),
+            local_files_only=False,
+        )
+        _pred_local = f"{_snap}/predictor/best_model"
+        model = Kronos.from_pretrained(_pred_local).to(device)
+        print(f"  Loaded predictor from {cfg.pretrained_predictor}@{cfg.hf_revision}/predictor/best_model")
+    else:
+        model = Kronos.from_pretrained(cfg.pretrained_predictor).to(device)
     amp_enabled, amp_dtype = _resolve_amp(cfg.amp_dtype)
     amp_enabled = amp_enabled and device.type == "cuda"
     scaler = GradScaler() if (amp_enabled and amp_dtype == torch.float16) else None
@@ -308,7 +324,7 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
     start_epoch, global_step = _load_latest_checkpoint(ckpt_dir, model, optimizer, scheduler)
     log_path = save_dir / "train_log.csv"
     if not log_path.exists():
-        log_path.write_text("epoch,step,train_loss,val_loss,val_ic\n")
+        log_path.write_text("epoch,step,train_loss,val_loss,val_ic,ic_ir_h5\n")
 
     predictor = KronosPredictor(model, tokenizer, device=device, max_context=cfg.max_context)
     all_syms = [s for s in list_symbols(cfg.db_path) if s != cfg.benchmark_symbol]
@@ -392,25 +408,33 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
             cfg.val_steps_per_epoch,
         )
         model.eval()
-        val_ic = validate_predictor_ic(
-            _make_predict_batch_fn(predictor),
-            lambda sym, last, n: _actual_close_lookup(cfg, actual_cache, sym, last, n),
-            val_universe,
-            val_dates,
-            cfg,
-            lambda sym, rebal_date: _build_ctx_for_date(cfg, sym, rebal_date),
-        )
-        with open(log_path, "a") as f:
-            f.write(f"{epoch+1},{global_step},{loss.item():.4f},{val_loss:.4f},{val_ic:.4f}\n")
+        predict_fn = _make_predict_batch_fn(predictor)
+        actual_fn = lambda sym, last, n: _actual_close_lookup(cfg, actual_cache, sym, last, n)
+        ctx_fn = lambda sym, rebal_date: _build_ctx_for_date(cfg, sym, rebal_date)
 
-        is_best, should_stop = stopper.update(val_ic)
+        val_ic = validate_predictor_ic(predict_fn, actual_fn, val_universe, val_dates, cfg, ctx_fn)
+        ic_ir_h5 = validate_predictor_ic_ir(predict_fn, actual_fn, val_universe, val_dates, cfg, ctx_fn,
+                                             target_horizon=min(5, cfg.pred_len))
+
+        ic_ir_str = f"{ic_ir_h5:.4f}" if not (ic_ir_h5 != ic_ir_h5) else "nan"
+        print(f"  val_loss={val_loss:.4f}  val_ic={val_ic:.4f}  ic_ir_h5={ic_ir_str}")
+        with open(log_path, "a") as f:
+            f.write(f"{epoch+1},{global_step},{loss.item():.4f},{val_loss:.4f},{val_ic:.4f},{ic_ir_str}\n")
+
+        # Use ic_ir_h5 for early stopping; fall back to val_ic if ic_ir_h5 is nan
+        stop_metric = ic_ir_h5 if (ic_ir_h5 == ic_ir_h5) else val_ic
+        is_best, should_stop = stopper.update(stop_metric)
         if is_best:
             model.save_pretrained(str(save_dir / "best_model"))
-            print(f"  -> new best val_ic={val_ic:.4f} (val_loss={val_loss:.4f}), saved.")
+            print(f"  -> new best ic_ir_h5={ic_ir_str} val_ic={val_ic:.4f} (epoch {epoch+1}), saved.")
             _gdrive_sync(save_dir / "best_model", remote=remote_root)
             _gdrive_sync_logs(log_path, remote_root)
+            if cfg.hf_repo and cfg.hf_revision_out:
+                push_best_model(save_dir / "best_model", cfg.hf_repo,
+                                "predictor/best_model", cfg.hf_revision_out)
+                push_file(log_path, cfg.hf_repo, "predictor/train_log.csv", cfg.hf_revision_out)
         if should_stop:
-            print(f"  -> early stop at epoch {epoch+1} (best val_ic={stopper.best:.4f})")
+            print(f"  -> early stop at epoch {epoch+1} (best ic_ir_h5={stopper.best:.4f})")
             break
 
 
@@ -462,6 +486,7 @@ def main() -> None:
     parser.add_argument("--config", default="finetune_tw/configs/config_tw_daily.yaml")
     cfg = Config.from_yaml(parser.parse_args().config)
     run_training(cfg)
+    wait_for_pushes()
 
 
 if __name__ == "__main__":

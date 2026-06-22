@@ -1,134 +1,210 @@
 """
-python finetune_tw/backtest.py --config finetune_tw/configs/config_tw_daily.yaml
-Loads fine-tuned weights from local path or HuggingFace Hub (cfg.hf_repo / cfg.hf_revision).
+Run inference for one model, output daily-returns JSON for later plotting.
+
+Usage:
+    python -m finetune_tw.backtest \\
+        --config finetune_tw/configs/config_tw_daily_rtx6000.yaml \\
+        --model round2
+
+    # Custom hold variants:
+    python -m finetune_tw.backtest --config ... --model round2 --hold_days_list 5 10 20
+
+Model choices: pretrained | round0 | round1 | round2
+Output: {output_dir}/{exp_name}/backtest_returns_{model}.json
+         {output_dir}/{exp_name}/backtest_{model}.png
 """
 from __future__ import annotations
 import argparse
 import json
+import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
 
 from model import Kronos, KronosTokenizer, KronosPredictor
 from finetune_tw.config import Config
 from finetune_tw.db import query_symbol, list_symbols
-from finetune_tw.hf_utils import resolve_src
+from finetune_tw.hf_utils import has_weights
 
 
-# ── Pure helper functions (testable without a model) ────────────────────────
+# ── Metrics ──────────────────────────────────────────────────────────────────
 
 def compute_metrics(daily_returns: pd.Series) -> dict:
     ann_ret = (1 + daily_returns).prod() ** (252 / len(daily_returns)) - 1
     sharpe = (daily_returns.mean() / (daily_returns.std() + 1e-9)) * np.sqrt(252)
     cum = (1 + daily_returns).cumprod()
     max_dd = ((cum.cummax() - cum) / cum.cummax()).max()
-    return {"annualised_return": float(ann_ret), "sharpe": float(sharpe), "max_drawdown": float(max_dd)}
+    return {"annualised_return": float(ann_ret), "sharpe": float(sharpe),
+            "max_drawdown": float(max_dd)}
 
+
+# ── Portfolio ─────────────────────────────────────────────────────────────────
 
 def rank_stocks(signals: dict[str, float], top_k: int) -> set[str]:
-    sorted_syms = sorted(signals, key=signals.__getitem__, reverse=True)
-    return set(sorted_syms[:top_k])
+    return set(sorted(signals, key=signals.__getitem__, reverse=True)[:top_k])
 
 
 def build_portfolio_returns(
     price_data: dict[str, pd.Series],
     holdings_sequence: list[set[str]],
     rebalance_dates: pd.Index,
-) -> tuple[pd.Series, pd.Series]:
-    """
-    Returns:
-        period_returns: avg return per hold period, indexed by rebalance_dates[:-1]
-        daily_returns:  daily portfolio returns across all hold periods (for accurate metrics)
-    """
-    period_rets = []
+) -> pd.Series:
     all_daily: list[pd.Series] = []
-
     for i in range(len(rebalance_dates) - 1):
-        date = rebalance_dates[i]
-        next_date = rebalance_dates[i + 1]
-        holdings = holdings_sequence[i]
-
-        period_sym_rets = []
+        date, next_date = rebalance_dates[i], rebalance_dates[i + 1]
         daily_sym_series = []
-
-        for sym in holdings:
+        for sym in holdings_sequence[i]:
             if sym not in price_data:
                 continue
             series = price_data[sym]
-            mask = (series.index >= date) & (series.index <= next_date)
-            sub = series[mask]
-            if len(sub) < 2:
-                continue
-            period_sym_rets.append(sub.iloc[-1] / sub.iloc[0] - 1)
-            daily_sym_series.append(sub.pct_change().dropna())
-
-        period_rets.append(float(np.mean(period_sym_rets)) if period_sym_rets else 0.0)
-
+            sub = series[(series.index >= date) & (series.index <= next_date)]
+            if len(sub) >= 2:
+                daily_sym_series.append(sub.pct_change().dropna())
         if daily_sym_series:
-            combined = pd.concat(daily_sym_series, axis=1).mean(axis=1)
-            all_daily.append(combined)
+            all_daily.append(pd.concat(daily_sym_series, axis=1).mean(axis=1))
 
-    period_series = pd.Series(period_rets, index=rebalance_dates[:-1])
+    if not all_daily:
+        return pd.Series(dtype=float)
+    dr = pd.concat(all_daily).sort_index()
+    return dr[~dr.index.duplicated(keep="first")]
 
-    if all_daily:
-        daily_returns = pd.concat(all_daily).sort_index()
-        daily_returns = daily_returns[~daily_returns.index.duplicated(keep="first")]
+
+def signals_to_holdings(
+    raw_preds: dict[str, dict[str, pd.Series]],
+    rebal_dates: pd.DatetimeIndex,
+    hold_days: int,
+    top_k: int,
+) -> list[set[str]]:
+    holdings = []
+    for d in rebal_dates:
+        date_preds = raw_preds.get(d.strftime("%Y-%m-%d"), {})
+        signals = {sym: ret.iloc[hold_days - 1]
+                   for sym, ret in date_preds.items() if len(ret) >= hold_days}
+        holdings.append(rank_stocks(signals, top_k))
+    return holdings
+
+
+# ── Model spec ────────────────────────────────────────────────────────────────
+
+@dataclass
+class ModelSpec:
+    label: str
+    tok_src: str
+    tok_kwargs: dict
+    pred_src: str
+    pred_kwargs: dict
+
+
+def _hf_local(repo_id: str, subfolder: str, revision: str) -> str:
+    """Download a HF repo subfolder to cache and return the local path."""
+    from huggingface_hub import snapshot_download
+    token = os.environ.get("HF_TOKEN")
+    local = snapshot_download(
+        repo_id=repo_id,
+        revision=revision,
+        allow_patterns=[f"{subfolder}/*"],
+        token=token,
+    )
+    return str(Path(local) / subfolder)
+
+
+def build_model_specs(cfg: Config) -> dict[str, ModelSpec]:
+    exp_dir = Path(cfg.output_dir) / cfg.exp_name
+    local_tok  = exp_dir / "tokenizer" / "best_model"
+    local_pred = exp_dir / "predictor" / "best_model"
+    hf_repo = "j835111/kronos-tw-finetune"
+
+    # Round 0/1 share the same tokenizer (local if available, else HF round-0)
+    if has_weights(local_tok):
+        tok_src_local = str(local_tok)
     else:
-        daily_returns = pd.Series(dtype=float)
+        tok_src_local = None  # resolved lazily in load_predictor_from_spec
 
-    return period_series, daily_returns
+    return {
+        "pretrained": ModelSpec(
+            label="Pretrained",
+            tok_src=cfg.pretrained_tokenizer, tok_kwargs={},
+            pred_src=cfg.pretrained_predictor, pred_kwargs={},
+        ),
+        "round0": ModelSpec(
+            label="Round 0",
+            tok_src=tok_src_local or f"hf://{hf_repo}@round-0/tokenizer/best_model",
+            tok_kwargs={},
+            pred_src=f"hf://{hf_repo}@round-0/predictor/best_model",
+            pred_kwargs={},
+        ),
+        "round1": ModelSpec(
+            label="Round 1",
+            tok_src=tok_src_local or f"hf://{hf_repo}@round-0/tokenizer/best_model",
+            tok_kwargs={},
+            pred_src=str(local_pred) if has_weights(local_pred)
+                     else f"hf://{hf_repo}@round-1/predictor/best_model",
+            pred_kwargs={},
+        ),
+        "round2": ModelSpec(
+            label="Round 2",
+            tok_src=tok_src_local or f"hf://{hf_repo}@round-0/tokenizer/best_model",
+            tok_kwargs={},
+            pred_src=str(local_pred) if has_weights(local_pred)
+                     else f"hf://{hf_repo}@round-2/predictor/best_model",
+            pred_kwargs={},
+        ),
+    }
 
 
-# ── Main backtest loop ──────────────────────────────────────────────────────
+def _resolve_src(src: str) -> str:
+    """If src is hf://repo_id@revision/subfolder, download and return local path.
+    repo_id may contain '/' (e.g. owner/repo), so split on '@' first."""
+    if not src.startswith("hf://"):
+        return src
+    # hf://owner/repo@revision/subfolder
+    rest = src[5:]                              # "owner/repo@rev/sub/folder"
+    repo_id, rev_and_sub = rest.split("@", 1)  # "owner/repo", "rev/sub/folder"
+    revision, subfolder = rev_and_sub.split("/", 1)  # "rev", "sub/folder"
+    print(f"  [hf] downloading {repo_id}@{revision}/{subfolder} ...")
+    sys.stdout.flush()
+    return _hf_local(repo_id, subfolder, revision)
 
-def run_backtest(cfg: Config) -> None:
+
+def load_predictor_from_spec(spec: ModelSpec, cfg: Config) -> KronosPredictor:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-    exp_dir   = Path(cfg.output_dir) / cfg.exp_name
-    tok_path  = exp_dir / "tokenizer" / "best_model"
-    pred_path = exp_dir / "predictor" / "best_model"
-
-    tok_src,  tok_kw  = resolve_src(tok_path,  cfg.hf_repo, "tokenizer/best_model",  cfg.hf_revision)
-    pred_src, pred_kw = resolve_src(pred_path, cfg.hf_repo, "predictor/best_model", cfg.hf_revision)
-    tokenizer = KronosTokenizer.from_pretrained(tok_src,  **tok_kw)
-    model     = Kronos.from_pretrained(pred_src, **pred_kw)
+    tok_path  = _resolve_src(spec.tok_src)
+    pred_path = _resolve_src(spec.pred_src)
+    print(f"  tokenizer  ← {tok_path}")
+    print(f"  predictor  ← {pred_path}")
+    sys.stdout.flush()
+    tokenizer = KronosTokenizer.from_pretrained(tok_path, **spec.tok_kwargs)
+    model = Kronos.from_pretrained(pred_path, **spec.pred_kwargs)
     predictor = KronosPredictor(model, tokenizer, device=device, max_context=cfg.max_context)
     tokenizer.eval(); model.eval()
+    return predictor
 
-    symbols = [s for s in list_symbols(cfg.db_path) if s != cfg.benchmark_symbol]
-    test_end = str(pd.Timestamp.today().date())
 
-    print(f"Loaded {len(symbols)} symbols, test period {cfg.test_start_date} → {test_end}")
-    sys.stdout.flush()
+# ── Inference ─────────────────────────────────────────────────────────────────
 
-    # Pre-load close prices for all symbols over the test period
-    close_prices: dict[str, pd.Series] = {}
-    for sym in symbols:
-        df = query_symbol(cfg.db_path, sym, start=cfg.test_start_date, end=test_end)
-        if len(df) > 0:
-            idx = pd.DatetimeIndex(df["date"])
-            close_prices[sym] = pd.Series(df["close"].values, index=idx)
-
-    print(f"Pre-loaded close prices for {len(close_prices)} symbols")
-    sys.stdout.flush()
-
-    # Build rebalance dates
-    all_dates = pd.bdate_range(cfg.test_start_date, test_end)
-    rebalance_dates = all_dates[::cfg.hold_days]
-    print(f"Rebalance dates: {len(rebalance_dates)} periods (hold_days={cfg.hold_days})")
-    sys.stdout.flush()
-
+def compute_raw_signals(
+    predictor: KronosPredictor,
+    cfg: Config,
+    rebal_dates: pd.DatetimeIndex,
+    pred_len: int,
+    symbols: list[str],
+) -> dict[str, dict[str, pd.Series]]:
+    """raw_preds[date_str][sym] = Series of predicted close returns, iloc[h-1] = h-day return."""
     BATCH_SIZE = 64
-    holdings_sequence: list[set[str]] = []
-    for i, rebal_date in enumerate(rebalance_dates):
-        signals: dict[str, float] = {}
+    raw_preds: dict[str, dict[str, pd.Series]] = {}
+
+    for i, rebal_date in enumerate(rebal_dates):
         rebal_str = rebal_date.strftime("%Y-%m-%d")
         lookback_start = (rebal_date - pd.Timedelta(days=cfg.lookback_window * 2)).strftime("%Y-%m-%d")
-        y_ts = pd.date_range(rebal_date, periods=cfg.pred_len, freq="B")
+        y_ts = pd.date_range(rebal_date, periods=pred_len, freq="B")
 
         batch_syms, batch_dfs, batch_xts, batch_yts = [], [], [], []
         for sym in symbols:
@@ -144,87 +220,225 @@ def run_backtest(cfg: Config) -> None:
             batch_xts.append(pd.to_datetime(ctx["date"]).reset_index(drop=True))
             batch_yts.append(pd.Series(y_ts))
 
+        date_preds: dict[str, pd.Series] = {}
         with torch.no_grad():
             for b in range(0, len(batch_syms), BATCH_SIZE):
-                chunk_syms = batch_syms[b:b + BATCH_SIZE]
-                chunk_dfs = batch_dfs[b:b + BATCH_SIZE]
                 preds = predictor.predict_batch(
-                    df_list=chunk_dfs,
+                    df_list=batch_dfs[b:b + BATCH_SIZE],
                     x_timestamp_list=batch_xts[b:b + BATCH_SIZE],
                     y_timestamp_list=batch_yts[b:b + BATCH_SIZE],
-                    pred_len=cfg.pred_len,
+                    pred_len=pred_len,
                     T=1.0, top_k=1, top_p=1.0, sample_count=1, verbose=False,
                 )
-                for sym, pred, ctx_df in zip(chunk_syms, preds, chunk_dfs):
-                    if pred is not None and len(pred) >= cfg.pred_len:
-                        signals[sym] = pred["close"].iloc[-1] / ctx_df["close"].iloc[-1] - 1
+                for sym, pred, ctx_df in zip(batch_syms[b:b + BATCH_SIZE], preds,
+                                              batch_dfs[b:b + BATCH_SIZE]):
+                    if pred is not None and len(pred) >= pred_len:
+                        last_close = ctx_df["close"].iloc[-1]
+                        date_preds[sym] = pred["close"].reset_index(drop=True) / last_close - 1
 
-        holdings_sequence.append(rank_stocks(signals, cfg.top_k))
+        raw_preds[rebal_str] = date_preds
         if (i + 1) % 5 == 0 or i == 0:
-            print(f"  [{i+1}/{len(rebalance_dates)}] {rebal_str}: {len(signals)} signals, top-{cfg.top_k} selected")
+            print(f"  [{i+1}/{len(rebal_dates)}] {rebal_str}: {len(date_preds)} signals")
             sys.stdout.flush()
 
-    _, daily_returns = build_portfolio_returns(close_prices, holdings_sequence, rebalance_dates)
+    return raw_preds
 
-    # Benchmark daily returns
+
+# ── Plotting ──────────────────────────────────────────────────────────────────
+
+_HOLD_COLORS = ["#2196F3", "#FF9800", "#4CAF50"]
+_BM_COLOR    = "#9E9E9E"
+_DD_ALPHA    = 0.18
+
+
+def plot_backtest_results(data: dict, out_dir: Path) -> Path:
+    """Generate a 2×2 chart grid from backtest JSON and save as PNG.
+
+    Layout:
+        Top-left:    Cumulative returns — all hold variants + benchmark
+        Top-right:   Per-variant Sharpe / Annual Return / Max DD bar chart
+        Bottom row:  One drawdown chart per hold variant (up to 3)
+    """
+    hold_variants = data["hold_variants"]
+    bm = data["benchmark"]
+    model_label = data["model_label"]
+    hold_keys = sorted(hold_variants, key=int)
+
+    bm_dates   = pd.DatetimeIndex(bm["dates"])
+    bm_cum     = (1 + pd.Series(bm["daily_returns"], index=bm_dates)).cumprod()
+
+    n_holds = len(hold_keys)
+    colors  = (_HOLD_COLORS * 4)[:n_holds]
+
+    fig = plt.figure(figsize=(14, 9))
+    fig.suptitle(f"Backtest — {model_label}  ({data['test_start']} → {data['test_end']}  top-K={data['top_k']})",
+                 fontsize=13, fontweight="bold")
+
+    gs = fig.add_gridspec(2, max(n_holds, 2), hspace=0.38, wspace=0.32)
+
+    # ── Top-left: cumulative returns ──────────────────────────────────────────
+    ax_cum = fig.add_subplot(gs[0, :n_holds // 2 + 1])
+    ax_cum.plot(bm_cum.index, bm_cum.values, color=_BM_COLOR, lw=1.5,
+                linestyle="--", label=f"^TWII  Sharpe={bm['metrics']['sharpe']:.2f}")
+    for hk, col in zip(hold_keys, colors):
+        v = hold_variants[hk]
+        dr = pd.Series(v["daily_returns"], index=pd.DatetimeIndex(v["dates"]))
+        cum = (1 + dr).cumprod()
+        m = v["metrics"]
+        ax_cum.plot(cum.index, cum.values, color=col, lw=1.8,
+                    label=f"hold={hk}d  Sharpe={m['sharpe']:.2f}  Ann={m['annualised_return']:.1%}")
+    ax_cum.set_ylabel("Cumulative Return")
+    ax_cum.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1, decimals=0))
+    ax_cum.axhline(1, color="black", lw=0.6, ls=":")
+    ax_cum.legend(fontsize=7.5, loc="upper left")
+    ax_cum.set_title("Cumulative Returns", fontsize=10)
+
+    # ── Top-right: metrics bar chart ──────────────────────────────────────────
+    ax_bar = fig.add_subplot(gs[0, n_holds // 2 + 1:])
+    metric_names = ["Ann Return", "Sharpe", "Max DD"]
+    x = np.arange(len(metric_names))
+    bar_w = 0.8 / (n_holds + 1)
+    for i, (hk, col) in enumerate(zip(hold_keys, colors)):
+        m = hold_variants[hk]["metrics"]
+        vals = [m["annualised_return"], m["sharpe"] / 3, -m["max_drawdown"]]
+        offset = (i - n_holds / 2) * bar_w
+        bars = ax_bar.bar(x + offset, vals, bar_w, color=col, label=f"hold={hk}d", alpha=0.85)
+    # benchmark reference line at 0
+    ax_bar.axhline(0, color="black", lw=0.5)
+    ax_bar.set_xticks(x); ax_bar.set_xticklabels(metric_names, fontsize=8)
+    ax_bar.set_title("Key Metrics (Ann Return | Sharpe/3 | −Max DD)", fontsize=9)
+    ax_bar.legend(fontsize=8)
+
+    # ── Bottom row: drawdown per hold variant ─────────────────────────────────
+    for j, (hk, col) in enumerate(zip(hold_keys, colors)):
+        ax_dd = fig.add_subplot(gs[1, j])
+        v = hold_variants[hk]
+        dr = pd.Series(v["daily_returns"], index=pd.DatetimeIndex(v["dates"]))
+        cum = (1 + dr).cumprod()
+        dd  = (cum.cummax() - cum) / cum.cummax()
+        ax_dd.fill_between(dd.index, -dd.values, 0, color=col, alpha=_DD_ALPHA)
+        ax_dd.plot(dd.index, -dd.values, color=col, lw=1)
+        ax_dd.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1, decimals=0))
+        ax_dd.set_title(f"Drawdown  hold={hk}d  MaxDD={v['metrics']['max_drawdown']:.1%}", fontsize=9)
+        ax_dd.set_ylim(bottom=-1)
+        # benchmark drawdown overlay
+        bm_dd = (bm_cum.cummax() - bm_cum) / bm_cum.cummax()
+        ax_dd.plot(bm_dd.index, -bm_dd.values, color=_BM_COLOR, lw=0.9, ls="--", alpha=0.7)
+
+    out_path = out_dir / f"backtest_{data['model_key']}.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Chart saved → {out_path}")
+    return out_path
+
+
+# ── Main logic ────────────────────────────────────────────────────────────────
+
+def run_backtest(cfg: Config, model_key: str, hold_days_list: list[int]) -> Path:
+    specs = build_model_specs(cfg)
+    if model_key not in specs:
+        raise ValueError(f"Unknown model '{model_key}'. Choose from: {list(specs)}")
+    spec = specs[model_key]
+
+    symbols = [s for s in list_symbols(cfg.db_path) if s != cfg.benchmark_symbol]
+    test_end = str(pd.Timestamp.today().date())
+    max_hold = max(hold_days_list)
+    min_hold = min(hold_days_list)
+
+    print(f"\n{'='*60}")
+    print(f"Model:  {spec.label}")
+    print(f"Hold variants: {hold_days_list}  |  pred_len={max_hold}")
+    print(f"Period: {cfg.test_start_date} → {test_end}")
+    print(f"{'='*60}")
+    sys.stdout.flush()
+
+    # Close prices for portfolio eval
+    close_prices: dict[str, pd.Series] = {}
+    for sym in symbols:
+        df = query_symbol(cfg.db_path, sym, start=cfg.test_start_date, end=test_end)
+        if len(df) > 0:
+            close_prices[sym] = pd.Series(df["close"].values,
+                                          index=pd.DatetimeIndex(df["date"]))
+    print(f"Loaded close prices: {len(close_prices)} symbols")
+    sys.stdout.flush()
+
+    # Benchmark
     bm_df = query_symbol(cfg.db_path, cfg.benchmark_symbol,
                          start=cfg.test_start_date, end=test_end)
-    bm_close = pd.Series(bm_df["close"].values,
-                         index=pd.DatetimeIndex(bm_df["date"]))
-    bm_daily = bm_close.pct_change().dropna()
-    bm_daily = bm_daily.reindex(daily_returns.index).fillna(0)
+    bm_daily = pd.Series(bm_df["close"].values,
+                         index=pd.DatetimeIndex(bm_df["date"])).pct_change().dropna()
 
-    metrics    = compute_metrics(daily_returns)
-    bm_metrics = compute_metrics(bm_daily)
-
-    print(f"\n=== Backtest Results ({cfg.test_start_date} → {test_end}) ===")
-    print(f"Strategy  — Ann. Return: {metrics['annualised_return']:.2%}  "
-          f"Sharpe: {metrics['sharpe']:.2f}  Max DD: {metrics['max_drawdown']:.2%}")
-    print(f"Benchmark — Ann. Return: {bm_metrics['annualised_return']:.2%}  "
-          f"Sharpe: {bm_metrics['sharpe']:.2f}  Max DD: {bm_metrics['max_drawdown']:.2%}")
+    # Inference — single pass covering all hold variants
+    predictor = load_predictor_from_spec(spec, cfg)
+    fine_dates = pd.bdate_range(cfg.test_start_date, test_end)[::min_hold]
+    print(f"Inference: {len(fine_dates)} periods × {len(symbols)} symbols")
     sys.stdout.flush()
+    raw_preds = compute_raw_signals(predictor, cfg, fine_dates, max_hold, symbols)
+    del predictor
+    torch.cuda.empty_cache()
 
-    # Save metrics JSON
+    # Build results per hold variant
+    hold_variants: dict[str, dict] = {}
+    for hd in hold_days_list:
+        step = hd // min_hold
+        variant_dates = fine_dates[::step]
+        holdings = signals_to_holdings(raw_preds, variant_dates, hd, cfg.top_k)
+        dr = build_portfolio_returns(close_prices, holdings, variant_dates)
+        m = compute_metrics(dr)
+        hold_variants[str(hd)] = {
+            "dates": [d.strftime("%Y-%m-%d") for d in dr.index],
+            "daily_returns": dr.tolist(),
+            "metrics": m,
+        }
+        print(f"  hold={hd}d — Ann:{m['annualised_return']:.2%}  "
+              f"Sharpe:{m['sharpe']:.2f}  DD:{m['max_drawdown']:.2%}")
+        sys.stdout.flush()
+
+    # Serialize output
+    out = {
+        "model_key":   model_key,
+        "model_label": spec.label,
+        "test_start":  cfg.test_start_date,
+        "test_end":    test_end,
+        "top_k":       cfg.top_k,
+        "hold_variants": hold_variants,
+        "benchmark": {
+            "dates":         [d.strftime("%Y-%m-%d") for d in bm_daily.index],
+            "daily_returns": bm_daily.tolist(),
+            "metrics":       compute_metrics(bm_daily),
+        },
+    }
+
     out_dir = Path(cfg.output_dir) / cfg.exp_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    metrics_out = {
-        "test_start": cfg.test_start_date,
-        "test_end": test_end,
-        "strategy": metrics,
-        "benchmark": bm_metrics,
-    }
-    (out_dir / "backtest_metrics.json").write_text(json.dumps(metrics_out, indent=2))
-    print(f"Metrics saved to {out_dir / 'backtest_metrics.json'}")
-
-    # Plot daily NAV
-    cum_strat = (1 + daily_returns).cumprod()
-    cum_bm    = (1 + bm_daily).cumprod()
-    plt.figure(figsize=(12, 5))
-    plt.plot(cum_strat.index, cum_strat.values, label="Kronos-TW Strategy")
-    plt.plot(cum_bm.index,    cum_bm.values,    label=cfg.benchmark_symbol, linestyle="--")
-    plt.title("Cumulative Return: Strategy vs Benchmark")
-    plt.xlabel("Date"); plt.ylabel("Cumulative Return")
-    plt.legend(); plt.tight_layout()
-    out_path = out_dir / "backtest_result.png"
-    plt.savefig(out_path)
-    print(f"Plot saved to {out_path}")
+    out_path = out_dir / f"backtest_returns_{model_key}.json"
+    out_path.write_text(json.dumps(out, indent=2))
+    print(f"\nSaved → {out_path}")
     sys.stdout.flush()
 
+    plot_backtest_results(out, out_dir)
+    return out_path
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="finetune_tw/configs/config_tw_daily.yaml")
-    parser.add_argument("--top_k",    type=int,   default=None)
-    parser.add_argument("--hold_days", type=int,  default=None)
-    parser.add_argument("--pred_len",  type=int,  default=None)
+    parser.add_argument("--model", required=True,
+                        choices=["pretrained", "round0", "round1", "round2"],
+                        help="Which model weights to load")
+    parser.add_argument("--hold_days_list", type=int, nargs="+", default=[5, 10, 15],
+                        help="Hold period variants in days (default: 5 10 15)")
+    parser.add_argument("--top_k",    type=int, default=None)
     parser.add_argument("--test_start", default=None)
     args = parser.parse_args()
+
     cfg = Config.from_yaml(args.config)
     if args.top_k:      cfg.top_k = args.top_k
-    if args.hold_days:  cfg.hold_days = args.hold_days
-    if args.pred_len:   cfg.pred_len = args.pred_len
     if args.test_start: cfg.test_start_date = args.test_start
-    run_backtest(cfg)
+
+    run_backtest(cfg, args.model, args.hold_days_list)
 
 
 if __name__ == "__main__":

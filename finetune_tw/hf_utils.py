@@ -54,6 +54,31 @@ def push_best_model(local_dir: Path, repo_id: str, subfolder: str, revision: str
     print(f"  [hf] push started (background) → {repo_id}@{revision}/{subfolder}")
 
 
+def push_file(local_path: Path, repo_id: str, path_in_repo: str, revision: str) -> None:
+    """Upload a single file to HF Hub in a background thread."""
+    token = _token()
+    if not token:
+        return
+
+    def _run() -> None:
+        try:
+            from huggingface_hub import upload_file
+            upload_file(
+                path_or_fileobj=str(local_path),
+                path_in_repo=path_in_repo,
+                repo_id=repo_id,
+                revision=revision,
+                token=token,
+                commit_message=f"update {path_in_repo}",
+            )
+        except Exception as exc:
+            print(f"  [hf] push_file failed: {exc}")
+
+    t = threading.Thread(target=_run, daemon=False, name="hf-push-file")
+    _push_threads.append(t)
+    t.start()
+
+
 def wait_for_pushes() -> None:
     """Block until all pending HF push threads complete. Call before process exit."""
     pending = [t for t in _push_threads if t.is_alive()]
