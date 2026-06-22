@@ -21,7 +21,7 @@ def single_fold(
     embargo_days: int = 110,
 ) -> WalkForwardFold:
     embargo_end = (
-        pd.Timestamp(train_end) + pd.Timedelta(days=embargo_days)
+        pd.Timestamp(train_end) + pd.offsets.BDay(embargo_days)
     ).strftime("%Y-%m-%d")
     return WalkForwardFold(
         train_start=train_start,

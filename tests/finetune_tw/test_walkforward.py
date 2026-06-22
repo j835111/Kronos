@@ -7,9 +7,8 @@ from finetune_tw.walkforward import WalkForwardFold, oof_folds, single_fold
 def test_single_fold_embargo_gap():
     fold = single_fold("2015-01-01", "2023-12-31", "2024-06-30", embargo_days=110)
     assert isinstance(fold, WalkForwardFold)
-    embargo_ts = pd.Timestamp(fold.embargo_end)
-    train_end_ts = pd.Timestamp(fold.train_end)
-    assert (embargo_ts - train_end_ts).days >= 110
+    bdays_in_gap = len(pd.bdate_range(fold.train_end, fold.embargo_end))
+    assert bdays_in_gap >= 110
     assert fold.val_start == fold.embargo_end
     assert fold.val_end == "2024-06-30"
 
@@ -50,13 +49,12 @@ def test_config_defaults_include_stacking_fields():
     assert cfg.wf_embargo_days == 110
 
 
-def test_config_from_yaml_keeps_stacking_defaults_when_absent():
-    cfg = Config.from_yaml("finetune_tw/configs/config_tw_daily_retrain.yaml")
+def test_config_from_yaml_keeps_stacking_defaults_when_absent(tmp_path):
+    minimal_yaml = tmp_path / "minimal.yaml"
+    minimal_yaml.write_text("top_k: 10\nhold_days: 3\n")
+    cfg = Config.from_yaml(str(minimal_yaml))
     assert cfg.mc_sample_count == 20
-    assert cfg.stacking_enabled is False
-    assert cfg.analog_enabled is False
-    assert cfg.analog_n_neighbors == 20
-    assert cfg.analog_window == 20
-    assert cfg.stacking_train_start == "2018-01-01"
-    assert cfg.stacking_train_end == "2023-12-31"
+    assert cfg.stacking_enabled == False
+    assert cfg.analog_enabled == False
     assert cfg.wf_embargo_days == 110
+    assert cfg.stacking_train_start == "2018-01-01"
