@@ -401,6 +401,8 @@ def _plot_stacking(data: dict, out_dir: Path) -> Path:
 
 
 def run_stacking_backtest(cfg: Config) -> dict:
+    if not getattr(cfg, "stacking_enabled", False):
+        raise ValueError("cfg.stacking_enabled must be True to run stacking backtest.")
     model_key = getattr(cfg, "model_key", "round0")
     specs = build_model_specs(cfg)
     if model_key not in specs:
