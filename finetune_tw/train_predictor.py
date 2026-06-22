@@ -229,11 +229,16 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
         p.requires_grad_(False)
 
     if cfg.hf_revision:
-        model = Kronos.from_pretrained(
+        from huggingface_hub import snapshot_download
+        _snap = snapshot_download(
             cfg.pretrained_predictor,
             revision=cfg.hf_revision,
-            subfolder="predictor/best_model",
-        ).to(device)
+            allow_patterns=["predictor/best_model/*"],
+            token=os.environ.get("HF_TOKEN"),
+            local_files_only=False,
+        )
+        _pred_local = f"{_snap}/predictor/best_model"
+        model = Kronos.from_pretrained(_pred_local).to(device)
         print(f"  Loaded predictor from {cfg.pretrained_predictor}@{cfg.hf_revision}/predictor/best_model")
     else:
         model = Kronos.from_pretrained(cfg.pretrained_predictor).to(device)
