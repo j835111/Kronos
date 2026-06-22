@@ -46,6 +46,11 @@ class Config:
     exp_name: str = "tw_daily"
     output_dir: str = "finetune_tw/outputs"
 
+    # HF Hub versioning (optional)
+    hf_repo: str = ""           # e.g. "j835111/kronos-tw-finetune"
+    hf_revision: str = ""       # revision to load pretrained_predictor from HF
+    hf_revision_out: str = ""   # revision to push best_model to HF after training
+
     # Backtest
     top_k: int = 20
     hold_days: int = 5
