@@ -222,10 +222,12 @@ def _collect_oof_features(
     symbols: list[str],
     date_range,
 ) -> pd.DataFrame:
+    inference_top_k = int(getattr(cfg, "mc_inference_top_k",
+                                      max(int(getattr(cfg, "top_k", 20)) * 2, 40)))
     extractor = KronosSignalExtractor(
         predictor,
         n_samples=int(getattr(cfg, "mc_sample_count", 20)),
-        top_k=max(int(getattr(cfg, "top_k", 20)) * 2, 40),
+        top_k=inference_top_k,
     )
     dates = _normalize_dates(cfg, date_range)
     return _build_feature_table(cfg, extractor, engine, symbols, dates, include_target=True)
@@ -240,10 +242,12 @@ def _run_test_backtest(
     test_dates,
 ) -> dict:
     dates = _normalize_dates(cfg, test_dates)
+    inference_top_k = int(getattr(cfg, "mc_inference_top_k",
+                                      max(int(getattr(cfg, "top_k", 20)) * 2, 40)))
     extractor = KronosSignalExtractor(
         predictor,
         n_samples=int(getattr(cfg, "mc_sample_count", 20)),
-        top_k=max(int(getattr(cfg, "top_k", 20)) * 2, 40),
+        top_k=inference_top_k,
     )
     feature_df = _build_feature_table(
         cfg,
@@ -504,6 +508,8 @@ def main() -> None:
                         help="Ignore cached OOF parquet/model and recompute from scratch")
     parser.add_argument("--mc", type=int, default=None,
                         help="Override mc_sample_count from config")
+    parser.add_argument("--inference-top-k", type=int, default=None,
+                        help="Override inference top_k for KronosSignalExtractor (default: max(cfg.top_k*2, 40))")
     parser.add_argument("--suffix", type=str, default="",
                         help="Suffix appended to output filenames (e.g. _mc3)")
     args = parser.parse_args()
@@ -515,6 +521,8 @@ def main() -> None:
         cfg.analog_enabled = False
     if args.mc is not None:
         cfg.mc_sample_count = args.mc
+    if args.inference_top_k is not None:
+        cfg.mc_inference_top_k = args.inference_top_k
 
     run_stacking_backtest(cfg, force_retrain=args.force_retrain, suffix=args.suffix)
 
