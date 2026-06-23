@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 
 _KRONOS_COLS = [
+    "kronos_greedy",
     "kronos_mean",
     "kronos_q10",
     "kronos_q50",
@@ -93,6 +94,7 @@ def build_feature_row(
     else:
         row.update(
             {
+                "kronos_greedy": float(kronos_signal.greedy_return),
                 "kronos_mean": float(kronos_signal.mean_return),
                 "kronos_q10": float(kronos_signal.q10),
                 "kronos_q50": float(kronos_signal.q50),

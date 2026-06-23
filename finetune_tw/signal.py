@@ -19,6 +19,7 @@ _PRICE_COLUMNS = ["open", "high", "low", "close", "volume", "amount"]
 
 @dataclass
 class KronosSignal:
+    greedy_return: float  # top_k=1 deterministic prediction (matches backtest.py signal quality)
     mean_return: float
     q10: float
     q50: float
@@ -87,6 +88,28 @@ class KronosSignalExtractor:
         last_closes = {sym: contexts[sym][3] for sym in sym_list}
 
         with torch.no_grad():
+            # Greedy pass (top_k=1): deterministic point estimate matching backtest.py quality
+            greedy_returns: dict[str, float] = {}
+            for start in range(0, len(sym_list), _BATCH_SIZE):
+                stop = start + _BATCH_SIZE
+                batch_syms = sym_list[start:stop]
+                preds = self.predictor.predict_batch(
+                    df_list=df_list[start:stop],
+                    x_timestamp_list=x_ts_list[start:stop],
+                    y_timestamp_list=y_ts_list[start:stop],
+                    pred_len=cfg.pred_len,
+                    T=1.0,
+                    top_k=1,
+                    top_p=1.0,
+                    sample_count=1,
+                    verbose=False,
+                )
+                for sym, pred in zip(batch_syms, preds):
+                    if pred is None or len(pred) <= horizon:
+                        continue
+                    greedy_returns[sym] = float(pred["close"].iloc[horizon]) / last_closes[sym] - 1.0
+
+            # Stochastic MC passes: uncertainty features (dispersion, quantiles, dir_prob)
             for _ in range(self.n_samples):
                 for start in range(0, len(sym_list), _BATCH_SIZE):
                     stop = start + _BATCH_SIZE
@@ -114,6 +137,7 @@ class KronosSignalExtractor:
             if len(arr) < 3:
                 continue
             results[sym] = KronosSignal(
+                greedy_return=greedy_returns.get(sym, float(arr.mean())),
                 mean_return=float(arr.mean()),
                 q10=float(np.percentile(arr, 10)),
                 q50=float(np.percentile(arr, 50)),
@@ -138,6 +162,7 @@ class KronosSignalExtractor:
                     {
                         "date": date,
                         "symbol": sym,
+                        "kronos_greedy": sig.greedy_return,
                         "kronos_mean": sig.mean_return,
                         "kronos_q10": sig.q10,
                         "kronos_q50": sig.q50,

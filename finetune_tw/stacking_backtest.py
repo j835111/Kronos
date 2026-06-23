@@ -300,7 +300,7 @@ def _run_test_backtest(
             if (date, sym) in scores.index
         }
         kronos_rank = {
-            sym: float(date_frame.loc[(date, sym), "kronos_mean"])
+            sym: float(date_frame.loc[(date, sym), "kronos_greedy"])
             for _, sym in date_frame.index
             if (date, sym) in date_frame.index
         }
