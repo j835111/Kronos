@@ -183,7 +183,10 @@ def _build_feature_table(
     rows: list[dict[str, float | pd.Timestamp | str]] = []
     horizon = max(0, min(hold_days, int(getattr(cfg, "pred_len", hold_days))) - 1)
 
-    for date in dates:
+    n_dates = len(dates)
+    for di, date in enumerate(dates):
+        if di % 20 == 0:
+            print(f"[stacking]   date {di+1}/{n_dates} ({date.date()})", flush=True)
         signals = extractor.extract_date(date, symbols, cfg, horizon=horizon)
         for sym in symbols:
             sym_frame = frames.get(sym, pd.DataFrame())
@@ -420,9 +423,12 @@ def run_stacking_backtest(cfg: Config) -> dict:
         getattr(cfg, "stacking_train_end", "2023-12-31"),
         embargo_days=int(getattr(cfg, "wf_embargo_days", 110)),
     )
-    for fold in folds:
+    print(f"[stacking] {len(symbols)} symbols, {len(folds)} OOF folds", flush=True)
+    for fi, fold in enumerate(folds):
+        print(f"[stacking] fold {fi+1}/{len(folds)}: {fold.val_start} → {fold.val_end}", flush=True)
         engine = _fit_analog_engine(cfg, symbols, fold.val_start)
         fold_df = _collect_oof_features(cfg, predictor, engine, symbols, fold)
+        print(f"[stacking] fold {fi+1} done: {len(fold_df)} rows", flush=True)
         if not fold_df.empty:
             combined_oof.append(fold_df)
 
@@ -430,13 +436,16 @@ def run_stacking_backtest(cfg: Config) -> dict:
         raise ValueError("No OOF stacking features were generated.")
 
     oof_df = pd.concat(combined_oof).sort_index()
+    print(f"[stacking] OOF total: {len(oof_df)} rows → saving parquet", flush=True)
     oof_path = out_dir / "stacking_features_oof.parquet"
     _save_feature_table(oof_df, oof_path)
 
+    print("[stacking] fitting LightGBM StackingModel ...", flush=True)
     stacking_model = StackingModel()
     stacking_model.fit(oof_df)
     model_path = out_dir / "stacking_model.lgb"
     stacking_model.save(str(model_path))
+    print(f"[stacking] model saved → {model_path}", flush=True)
 
     result: dict = {
         "model_key": f"stacking_{model_key}",
@@ -461,8 +470,10 @@ def run_stacking_backtest(cfg: Config) -> dict:
     test_dates = pd.bdate_range(getattr(cfg, "test_start_date", "2024-07-01"), _today())[
         :: max(1, int(getattr(cfg, "hold_days", 5)))
     ]
+    print(f"[stacking] test backtest: {len(test_dates)} dates from {getattr(cfg, 'test_start_date', '2024-07-01')}", flush=True)
     test_engine = _fit_analog_engine(cfg, symbols, getattr(cfg, "test_start_date", "2024-07-01"))
     test_result = _run_test_backtest(cfg, predictor, test_engine, stacking_model, symbols, test_dates)
+    print("[stacking] test backtest done", flush=True)
     result.update(test_result)
 
     json_path = out_dir / "backtest_stacking.json"
