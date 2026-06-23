@@ -46,3 +46,11 @@ hold_days: 3
 pred_len: 10
 test_start_date: "2024-07-01"
 benchmark_symbol: "^TWII"
+
+# Stacking meta-model
+stacking_enabled: true
+stacking_train_start: "2018-01-01"
+stacking_train_end: "2023-12-31"
+wf_embargo_days: 110
+mc_sample_count: 10
+analog_enabled: false
