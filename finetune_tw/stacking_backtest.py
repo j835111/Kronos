@@ -132,10 +132,7 @@ def _empty_feature_table(include_target: bool) -> pd.DataFrame:
 
 
 def _save_feature_table(feature_df: pd.DataFrame, path: Path) -> None:
-    try:
-        feature_df.to_parquet(path)
-    except ImportError:
-        feature_df.to_pickle(path)
+    feature_df.to_parquet(path)
 
 
 def _fit_analog_engine(
@@ -403,7 +400,7 @@ def _plot_stacking(data: dict, out_dir: Path) -> Path:
     return out_path
 
 
-def run_stacking_backtest(cfg: Config) -> dict:
+def run_stacking_backtest(cfg: Config, force_retrain: bool = False) -> dict:
     if not getattr(cfg, "stacking_enabled", False):
         raise ValueError("cfg.stacking_enabled must be True to run stacking backtest.")
     model_key = getattr(cfg, "model_key", "round0")
@@ -413,39 +410,48 @@ def run_stacking_backtest(cfg: Config) -> dict:
     spec = specs[model_key]
 
     out_dir = _out_dir(cfg)
-    predictor = load_predictor_from_spec(spec, cfg)
+    oof_path = out_dir / "stacking_features_oof.parquet"
+    model_path = out_dir / "stacking_model.lgb"
+
     benchmark_symbol = getattr(cfg, "benchmark_symbol", "^TWII")
     symbols = [sym for sym in list_symbols(getattr(cfg, "db_path", "")) if sym != benchmark_symbol]
 
-    combined_oof: list[pd.DataFrame] = []
-    folds = oof_folds(
-        getattr(cfg, "stacking_train_start", "2018-01-01"),
-        getattr(cfg, "stacking_train_end", "2023-12-31"),
-        embargo_days=int(getattr(cfg, "wf_embargo_days", 110)),
-    )
-    print(f"[stacking] {len(symbols)} symbols, {len(folds)} OOF folds", flush=True)
-    for fi, fold in enumerate(folds):
-        print(f"[stacking] fold {fi+1}/{len(folds)}: {fold.val_start} → {fold.val_end}", flush=True)
-        engine = _fit_analog_engine(cfg, symbols, fold.val_start)
-        fold_df = _collect_oof_features(cfg, predictor, engine, symbols, fold)
-        print(f"[stacking] fold {fi+1} done: {len(fold_df)} rows", flush=True)
-        if not fold_df.empty:
-            combined_oof.append(fold_df)
+    if not force_retrain and oof_path.exists() and model_path.exists():
+        print(f"[stacking] loading cached OOF features from {oof_path}", flush=True)
+        oof_df = pd.read_parquet(oof_path)
+        print(f"[stacking] loading cached model from {model_path}", flush=True)
+        stacking_model = StackingModel.load(str(model_path))
+        predictor = load_predictor_from_spec(spec, cfg)
+        print(f"[stacking] cache loaded: {len(oof_df)} OOF rows, skipping retrain", flush=True)
+    else:
+        predictor = load_predictor_from_spec(spec, cfg)
+        combined_oof: list[pd.DataFrame] = []
+        folds = oof_folds(
+            getattr(cfg, "stacking_train_start", "2018-01-01"),
+            getattr(cfg, "stacking_train_end", "2023-12-31"),
+            embargo_days=int(getattr(cfg, "wf_embargo_days", 110)),
+        )
+        print(f"[stacking] {len(symbols)} symbols, {len(folds)} OOF folds", flush=True)
+        for fi, fold in enumerate(folds):
+            print(f"[stacking] fold {fi+1}/{len(folds)}: {fold.val_start} → {fold.val_end}", flush=True)
+            engine = _fit_analog_engine(cfg, symbols, fold.val_start)
+            fold_df = _collect_oof_features(cfg, predictor, engine, symbols, fold)
+            print(f"[stacking] fold {fi+1} done: {len(fold_df)} rows", flush=True)
+            if not fold_df.empty:
+                combined_oof.append(fold_df)
 
-    if not combined_oof:
-        raise ValueError("No OOF stacking features were generated.")
+        if not combined_oof:
+            raise ValueError("No OOF stacking features were generated.")
 
-    oof_df = pd.concat(combined_oof).sort_index()
-    print(f"[stacking] OOF total: {len(oof_df)} rows → saving parquet", flush=True)
-    oof_path = out_dir / "stacking_features_oof.parquet"
-    _save_feature_table(oof_df, oof_path)
+        oof_df = pd.concat(combined_oof).sort_index()
+        print(f"[stacking] OOF total: {len(oof_df)} rows → saving parquet", flush=True)
+        _save_feature_table(oof_df, oof_path)
 
-    print("[stacking] fitting LightGBM StackingModel ...", flush=True)
-    stacking_model = StackingModel()
-    stacking_model.fit(oof_df)
-    model_path = out_dir / "stacking_model.lgb"
-    stacking_model.save(str(model_path))
-    print(f"[stacking] model saved → {model_path}", flush=True)
+        print("[stacking] fitting LightGBM StackingModel ...", flush=True)
+        stacking_model = StackingModel()
+        stacking_model.fit(oof_df)
+        stacking_model.save(str(model_path))
+        print(f"[stacking] model saved → {model_path}", flush=True)
 
     result: dict = {
         "model_key": f"stacking_{model_key}",
@@ -494,6 +500,8 @@ def main() -> None:
     )
     parser.add_argument("--train-only", action="store_true")
     parser.add_argument("--no-analog", action="store_true")
+    parser.add_argument("--force-retrain", action="store_true",
+                        help="Ignore cached OOF parquet/model and recompute from scratch")
     args = parser.parse_args()
 
     cfg = Config.from_yaml(args.config)
@@ -502,7 +510,7 @@ def main() -> None:
     if args.no_analog:
         cfg.analog_enabled = False
 
-    run_stacking_backtest(cfg)
+    run_stacking_backtest(cfg, force_retrain=args.force_retrain)
 
 
 if __name__ == "__main__":
