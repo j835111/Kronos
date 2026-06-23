@@ -386,7 +386,7 @@ def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_l
     return x
 
 
-def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False):
+def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, return_all_samples=False):
     with torch.no_grad():
         x = torch.clip(x, -clip, clip)
 
@@ -464,6 +464,8 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
         z = tokenizer.decode(input_tokens, half=True)
         z = z.reshape(-1, sample_count, z.size(1), z.size(2))
         preds = z.cpu().numpy()
+        if return_all_samples:
+            return preds  # (B, sample_count, seq_len, feat)
         preds = np.mean(preds, axis=1)
 
         return preds
@@ -505,16 +507,17 @@ class KronosPredictor:
         self.tokenizer = self.tokenizer.to(self.device)
         self.model = self.model.to(self.device)
 
-    def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose):
+    def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose, return_all_samples=False):
 
         x_tensor = torch.from_numpy(np.array(x).astype(np.float32)).to(self.device)
         x_stamp_tensor = torch.from_numpy(np.array(x_stamp).astype(np.float32)).to(self.device)
         y_stamp_tensor = torch.from_numpy(np.array(y_stamp).astype(np.float32)).to(self.device)
 
         preds = auto_regressive_inference(self.tokenizer, self.model, x_tensor, x_stamp_tensor, y_stamp_tensor, self.max_context, pred_len,
-                                          self.clip, T, top_k, top_p, sample_count, verbose)
-        preds = preds[:, -pred_len:, :]
-        return preds
+                                          self.clip, T, top_k, top_p, sample_count, verbose, return_all_samples)
+        if return_all_samples:
+            return preds[:, :, -pred_len:, :]  # (B, sample_count, pred_len, feat)
+        return preds[:, -pred_len:, :]
 
     def predict(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
 
@@ -659,4 +662,58 @@ class KronosPredictor:
             pred_dfs.append(pred_df)
 
         return pred_dfs
+
+    def predict_batch_samples(self, df_list, x_timestamp_list, y_timestamp_list, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=5, verbose=False):
+        """Like predict_batch but returns all individual MC samples without averaging.
+
+        All series must have the same historical length.
+
+        Returns:
+            list[np.ndarray]: each element has shape (sample_count, pred_len, n_cols), denormalized.
+        """
+        num_series = len(df_list)
+        x_list, x_stamp_list_p, y_stamp_list_p = [], [], []
+        means, stds = [], []
+        seq_lens, y_lens = [], []
+
+        for i in range(num_series):
+            df = df_list[i].copy()
+            if self.vol_col not in df.columns:
+                df[self.vol_col] = 0.0
+                df[self.amt_vol] = 0.0
+            if self.amt_vol not in df.columns:
+                df[self.amt_vol] = df[self.vol_col] * df[self.price_cols].mean(axis=1)
+
+            x = df[self.price_cols + [self.vol_col, self.amt_vol]].values.astype(np.float32)
+            x_stamp = calc_time_stamps(x_timestamp_list[i]).values.astype(np.float32)
+            y_stamp = calc_time_stamps(y_timestamp_list[i]).values.astype(np.float32)
+
+            x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0)
+            x_norm = np.clip((x - x_mean) / (x_std + 1e-5), -self.clip, self.clip)
+
+            x_list.append(x_norm)
+            x_stamp_list_p.append(x_stamp)
+            y_stamp_list_p.append(y_stamp)
+            means.append(x_mean)
+            stds.append(x_std)
+            seq_lens.append(x_norm.shape[0])
+            y_lens.append(y_stamp.shape[0])
+
+        if len(set(seq_lens)) != 1:
+            raise ValueError(f"predict_batch_samples requires consistent historical lengths, got: {seq_lens}")
+        if len(set(y_lens)) != 1:
+            raise ValueError(f"predict_batch_samples requires consistent prediction lengths, got: {y_lens}")
+
+        x_batch = np.stack(x_list, axis=0).astype(np.float32)
+        x_stamp_batch = np.stack(x_stamp_list_p, axis=0).astype(np.float32)
+        y_stamp_batch = np.stack(y_stamp_list_p, axis=0).astype(np.float32)
+
+        # preds: (B, sample_count, pred_len, n_feats)
+        preds = self.generate(x_batch, x_stamp_batch, y_stamp_batch, pred_len, T, top_k, top_p, sample_count, verbose, return_all_samples=True)
+
+        result = []
+        for i in range(num_series):
+            denorm = preds[i] * (stds[i] + 1e-5) + means[i]  # (sample_count, pred_len, n_feats)
+            result.append(denorm)
+        return result
 

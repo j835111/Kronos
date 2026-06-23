@@ -15,6 +15,7 @@ from finetune_tw.db import query_symbol
 
 _BATCH_SIZE = 256
 _PRICE_COLUMNS = ["open", "high", "low", "close", "volume", "amount"]
+_CLOSE_IDX = _PRICE_COLUMNS.index("close")
 
 
 @dataclass
@@ -109,27 +110,28 @@ class KronosSignalExtractor:
                         continue
                     greedy_returns[sym] = float(pred["close"].iloc[horizon]) / last_closes[sym] - 1.0
 
-            # Stochastic MC passes: uncertainty features (dispersion, quantiles, dir_prob)
-            for _ in range(self.n_samples):
-                for start in range(0, len(sym_list), _BATCH_SIZE):
-                    stop = start + _BATCH_SIZE
-                    batch_syms = sym_list[start:stop]
-                    preds = self.predictor.predict_batch(
-                        df_list=df_list[start:stop],
-                        x_timestamp_list=x_ts_list[start:stop],
-                        y_timestamp_list=y_ts_list[start:stop],
-                        pred_len=cfg.pred_len,
-                        T=self.temperature,
-                        top_k=self.top_k,
-                        top_p=1.0,
-                        sample_count=1,
-                        verbose=False,
-                    )
-                    for sym, pred in zip(batch_syms, preds):
-                        if pred is None or len(pred) <= horizon:
-                            continue
-                        ret = float(pred["close"].iloc[horizon]) / last_closes[sym] - 1.0
-                        sample_returns[sym].append(ret)
+            # Stochastic MC passes: all n_samples drawn in one batched GPU call per batch
+            for start in range(0, len(sym_list), _BATCH_SIZE):
+                stop = start + _BATCH_SIZE
+                batch_syms = sym_list[start:stop]
+                all_samples = self.predictor.predict_batch_samples(
+                    df_list=df_list[start:stop],
+                    x_timestamp_list=x_ts_list[start:stop],
+                    y_timestamp_list=y_ts_list[start:stop],
+                    pred_len=cfg.pred_len,
+                    T=self.temperature,
+                    top_k=self.top_k,
+                    top_p=1.0,
+                    sample_count=self.n_samples,
+                    verbose=False,
+                )
+                for sym, samples in zip(batch_syms, all_samples):
+                    # samples: (n_samples, pred_len, n_feats)
+                    if samples.shape[1] <= horizon:
+                        continue
+                    close_prices = samples[:, horizon, _CLOSE_IDX]  # (n_samples,)
+                    rets = close_prices / last_closes[sym] - 1.0
+                    sample_returns[sym].extend(rets.tolist())
 
         results: dict[str, KronosSignal] = {}
         for sym, returns in sample_returns.items():
