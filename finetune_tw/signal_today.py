@@ -16,12 +16,15 @@ import pandas as pd
 import torch
 
 from finetune_tw.config import Config
-from finetune_tw.db import list_symbols, query_symbol, get_last_date
+from finetune_tw.db import list_symbols, get_last_date, query_symbols_window
 from finetune_tw.backtest import (
     build_model_specs,
     load_predictor_from_spec,
     rank_stocks,
 )
+
+
+_PRICE_COLUMNS = ["open", "high", "low", "close", "volume", "amount"]
 
 
 def _last_trading_day(db_path: str, benchmark: str = "^TWII") -> str:
@@ -40,6 +43,42 @@ def _last_trading_day(db_path: str, benchmark: str = "^TWII") -> str:
     return d
 
 
+def _load_signal_contexts(
+    cfg: Config,
+    rebal_date: pd.Timestamp,
+    hold_days: int,
+    symbols: list[str],
+) -> list[tuple[str, pd.DataFrame, pd.Series, pd.Series]]:
+    rebal_str = rebal_date.strftime("%Y-%m-%d")
+    lookback_start = (
+        rebal_date - pd.Timedelta(days=cfg.lookback_window * 2)
+    ).strftime("%Y-%m-%d")
+    y_ts = pd.Series(pd.date_range(rebal_date, periods=hold_days, freq="B"))
+
+    rows = query_symbols_window(
+        cfg.db_path,
+        symbols,
+        start=lookback_start,
+        end=rebal_str,
+    )
+    if rows.empty:
+        return []
+
+    grouped = {sym: grp.reset_index(drop=True) for sym, grp in rows.groupby("symbol", sort=False)}
+    contexts = []
+    for sym in symbols:
+        df = grouped.get(sym)
+        if df is None or len(df) < cfg.lookback_window:
+            continue
+        ctx = df.iloc[-cfg.lookback_window:].reset_index(drop=True)
+        ctx_df = ctx[_PRICE_COLUMNS].reset_index(drop=True)
+        if ctx_df.isnull().any().any():
+            continue
+        x_ts = pd.to_datetime(ctx["date"]).reset_index(drop=True)
+        contexts.append((sym, ctx_df, x_ts, y_ts.copy()))
+    return contexts
+
+
 def get_signals_for_date(
     predictor,
     cfg: Config,
@@ -50,39 +89,53 @@ def get_signals_for_date(
     """對單一 rebal_date 執行推論，回傳 {sym: hold_days 預測報酬率}。"""
     BATCH_SIZE = 64
     rebal_str = rebal_date.strftime("%Y-%m-%d")
-    lookback_start = (
-        rebal_date - pd.Timedelta(days=cfg.lookback_window * 2)
-    ).strftime("%Y-%m-%d")
-
-    batch_syms, batch_dfs, batch_xts, batch_yts = [], [], [], []
-    y_ts = pd.date_range(rebal_date, periods=hold_days, freq="B")
-
-    for sym in symbols:
-        df = query_symbol(cfg.db_path, sym, start=lookback_start, end=rebal_str)
-        if len(df) < cfg.lookback_window:
-            continue
-        ctx = df.iloc[-cfg.lookback_window:]
-        ctx_df = ctx[["open", "high", "low", "close", "volume", "amount"]].reset_index(drop=True)
-        if ctx_df.isnull().any().any():
-            continue
-        batch_syms.append(sym)
-        batch_dfs.append(ctx_df)
-        batch_xts.append(pd.to_datetime(ctx["date"]).reset_index(drop=True))
-        batch_yts.append(pd.Series(y_ts))
+    contexts = _load_signal_contexts(cfg, rebal_date, hold_days, symbols)
+    batch_syms = [sym for sym, _, _, _ in contexts]
+    batch_dfs = [ctx_df for _, ctx_df, _, _ in contexts]
+    batch_xts = [x_ts for _, _, x_ts, _ in contexts]
+    batch_yts = [y_ts for _, _, _, y_ts in contexts]
 
     print(f"  推論 {len(batch_syms)} 支股票（日期 {rebal_str}）...")
     sys.stdout.flush()
 
     signals: dict[str, float] = {}
+    has_prepared_batch_api = (
+        hasattr(predictor, "prepare_batch_inputs")
+        and hasattr(predictor, "predict_prepared_batch")
+    )
     with torch.no_grad():
         for b in range(0, len(batch_syms), BATCH_SIZE):
-            preds = predictor.predict_batch(
-                df_list=batch_dfs[b : b + BATCH_SIZE],
-                x_timestamp_list=batch_xts[b : b + BATCH_SIZE],
-                y_timestamp_list=batch_yts[b : b + BATCH_SIZE],
-                pred_len=hold_days,
-                T=1.0, top_k=1, top_p=1.0, sample_count=1, verbose=False,
-            )
+            df_slice = batch_dfs[b : b + BATCH_SIZE]
+            xt_slice = batch_xts[b : b + BATCH_SIZE]
+            yt_slice = batch_yts[b : b + BATCH_SIZE]
+            if has_prepared_batch_api:
+                prepared = predictor.prepare_batch_inputs(
+                    df_list=df_slice,
+                    x_timestamp_list=xt_slice,
+                    y_timestamp_list=yt_slice,
+                    pred_len=hold_days,
+                )
+                preds = predictor.predict_prepared_batch(
+                    *prepared,
+                    pred_len=hold_days,
+                    T=1.0,
+                    top_k=1,
+                    top_p=1.0,
+                    sample_count=1,
+                    verbose=False,
+                )
+            else:
+                preds = predictor.predict_batch(
+                    df_list=df_slice,
+                    x_timestamp_list=xt_slice,
+                    y_timestamp_list=yt_slice,
+                    pred_len=hold_days,
+                    T=1.0,
+                    top_k=1,
+                    top_p=1.0,
+                    sample_count=1,
+                    verbose=False,
+                )
             for sym, pred, ctx_df in zip(
                 batch_syms[b : b + BATCH_SIZE],
                 preds,
