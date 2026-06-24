@@ -48,8 +48,9 @@ def compute_metrics(daily_returns: pd.Series) -> dict:
 
 # ── Portfolio ─────────────────────────────────────────────────────────────────
 
-def rank_stocks(signals: dict[str, float], top_k: int) -> set[str]:
-    return set(sorted(signals, key=signals.__getitem__, reverse=True)[:top_k])
+def rank_stocks(signals: dict[str, float], top_k: int, threshold: float = 0.0) -> set[str]:
+    eligible = {sym: v for sym, v in signals.items() if v >= threshold}
+    return set(sorted(eligible, key=eligible.__getitem__, reverse=True)[:top_k])
 
 
 def build_portfolio_returns(
@@ -90,13 +91,14 @@ def signals_to_holdings(
     rebal_dates: pd.DatetimeIndex,
     hold_days: int,
     top_k: int,
+    threshold: float = 0.0,
 ) -> list[set[str]]:
     holdings = []
     for d in rebal_dates:
         date_preds = raw_preds.get(d.strftime("%Y-%m-%d"), {})
         signals = {sym: ret.iloc[hold_days - 1]
                    for sym, ret in date_preds.items() if len(ret) >= hold_days}
-        holdings.append(rank_stocks(signals, top_k))
+        holdings.append(rank_stocks(signals, top_k, threshold))
     return holdings
 
 
@@ -390,7 +392,7 @@ def run_backtest(cfg: Config, model_key: str, hold_days_list: list[int]) -> Path
     for hd in hold_days_list:
         step = hd // min_hold
         variant_dates = fine_dates[::step]
-        holdings = signals_to_holdings(raw_preds, variant_dates, hd, cfg.top_k)
+        holdings = signals_to_holdings(raw_preds, variant_dates, hd, cfg.top_k, cfg.min_signal_threshold)
         _, dr = build_portfolio_returns(close_prices, holdings, variant_dates)
         m = compute_metrics(dr)
         hold_variants[str(hd)] = {
@@ -440,11 +442,14 @@ def main() -> None:
                         help="Hold period variants in days (default: 5 10 15)")
     parser.add_argument("--top_k",    type=int, default=None)
     parser.add_argument("--test_start", default=None)
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="Min predicted return to include a stock (default: config value)")
     args = parser.parse_args()
 
     cfg = Config.from_yaml(args.config)
     if args.top_k:      cfg.top_k = args.top_k
     if args.test_start: cfg.test_start_date = args.test_start
+    if args.threshold is not None: cfg.min_signal_threshold = args.threshold
 
     run_backtest(cfg, args.model, args.hold_days_list)
 

@@ -57,6 +57,7 @@ class Config:
     pred_len: int = 10
     test_start_date: str = "2024-07-01"
     benchmark_symbol: str = "^TWII"
+    min_signal_threshold: float = 0.0  # skip stocks with predicted return below this; 0.0 = only positive
 
     # Stacking meta-model
     mc_sample_count: int = 20
