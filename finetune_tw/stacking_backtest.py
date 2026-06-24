@@ -262,6 +262,7 @@ def _run_test_backtest(
     stacking_model: StackingModel,
     symbols: list[str],
     test_dates,
+    out_dir: Path | None = None,
 ) -> dict:
     dates = _normalize_dates(cfg, test_dates)
     inference_top_k = int(getattr(cfg, "mc_inference_top_k",
@@ -271,6 +272,7 @@ def _run_test_backtest(
         n_samples=int(getattr(cfg, "mc_sample_count", 20)),
         top_k=inference_top_k,
     )
+    partial_ckpt = (out_dir / "stacking_test_partial.parquet") if out_dir is not None else None
     feature_df = _build_feature_table(
         cfg,
         extractor,
@@ -278,7 +280,10 @@ def _run_test_backtest(
         symbols,
         dates,
         include_target=False,
+        partial_ckpt=partial_ckpt,
     )
+    if partial_ckpt is not None and partial_ckpt.exists():
+        partial_ckpt.unlink()
 
     benchmark_symbol = getattr(cfg, "benchmark_symbol", "^TWII")
     hold_days = int(getattr(cfg, "hold_days", 5))
@@ -537,7 +542,8 @@ def run_stacking_backtest(cfg: Config, force_retrain: bool = False, suffix: str 
     ]
     print(f"[stacking] test backtest: {len(test_dates)} dates from {getattr(cfg, 'test_start_date', '2024-07-01')}", flush=True)
     test_engine = _fit_analog_engine(cfg, symbols, getattr(cfg, "test_start_date", "2024-07-01"))
-    test_result = _run_test_backtest(cfg, predictor, test_engine, stacking_model, symbols, test_dates)
+    test_result = _run_test_backtest(cfg, predictor, test_engine, stacking_model, symbols, test_dates,
+                                     out_dir=out_dir)
     print("[stacking] test backtest done", flush=True)
     result.update(test_result)
 
