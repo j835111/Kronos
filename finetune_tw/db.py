@@ -70,8 +70,8 @@ def query_symbol(
 def query_symbols_window(
     db_path: str,
     symbols: list[str],
-    start: str = None,
-    end: str = None,
+    start: str | None = None,
+    end: str | None = None,
 ) -> pd.DataFrame:
     columns = ["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
     if not symbols:
