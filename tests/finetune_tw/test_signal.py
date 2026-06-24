@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import pytest
 from unittest.mock import MagicMock
@@ -18,8 +19,13 @@ def _make_pred_df(close_val: float) -> pd.DataFrame:
     )
 
 
-def _make_mock_predictor(close_values: list[float]) -> MagicMock:
-    calls = iter(close_values)
+def _make_pred_samples(close_val: float, pred_len: int, sample_count: int) -> np.ndarray:
+    samples = np.zeros((sample_count, pred_len, 6), dtype=float)
+    samples[:, :, 3] = close_val
+    return samples
+
+
+def _make_mock_predictor(close_val: float = 1.05, mc_samples: int = 3) -> MagicMock:
 
     def predict_batch(
         df_list,
@@ -33,16 +39,31 @@ def _make_mock_predictor(close_values: list[float]) -> MagicMock:
         verbose,
     ):
         assert sample_count == 1
-        val = next(calls, 1.0)
-        return [_make_pred_df(val) for _ in df_list]
+        return [_make_pred_df(close_val) for _ in df_list]
+
+    def predict_batch_samples(
+        df_list,
+        x_timestamp_list,
+        y_timestamp_list,
+        pred_len,
+        T,
+        top_k,
+        top_p,
+        sample_count,
+        verbose,
+    ):
+        assert sample_count == mc_samples
+        return [_make_pred_samples(close_val, pred_len, sample_count) for _ in df_list]
 
     predictor = MagicMock()
     predictor.predict_batch.side_effect = predict_batch
+    predictor.predict_batch_samples.side_effect = predict_batch_samples
     return predictor
 
 
 def test_kronos_signal_fields():
     sig = KronosSignal(
+        greedy_return=0.04,
         mean_return=0.05,
         q10=0.01,
         q50=0.05,
@@ -50,12 +71,13 @@ def test_kronos_signal_fields():
         dispersion=0.02,
         dir_prob=0.8,
     )
+    assert sig.greedy_return == pytest.approx(0.04)
     assert sig.mean_return == pytest.approx(0.05)
     assert sig.dir_prob == pytest.approx(0.8)
 
 
 def test_extract_date_returns_signals():
-    predictor = _make_mock_predictor([1.05] * 20)
+    predictor = _make_mock_predictor(close_val=1.05, mc_samples=3)
 
     cfg = MagicMock()
     cfg.db_path = ":memory:"
@@ -98,7 +120,7 @@ def test_extract_date_returns_signals():
 
 
 def test_extract_date_range_returns_dataframe():
-    predictor = _make_mock_predictor([1.05] * 200)
+    predictor = _make_mock_predictor(close_val=1.05, mc_samples=3)
     cfg = MagicMock()
     cfg.db_path = ":memory:"
     cfg.lookback_window = 3
@@ -130,6 +152,7 @@ def test_extract_date_range_returns_dataframe():
         sig_mod.KronosSignalExtractor._load_context = original
 
     assert isinstance(df, pd.DataFrame)
+    assert "kronos_greedy" in df.columns
     assert "kronos_mean" in df.columns
     assert "kronos_dir_prob" in df.columns
     assert df.index.names == ["date", "symbol"]
