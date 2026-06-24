@@ -68,10 +68,20 @@ def test_predict_prepared_batch_matches_predict_batch():
         ],
         dtype=np.float32,
     )
+    generate_calls = []
 
     def fake_generate(x_batch, x_stamp_batch, y_stamp_batch, pred_len, T, top_k, top_p, sample_count, verbose, return_all_samples=False):
-        assert pred_len == 2
-        assert return_all_samples is False
+        generate_calls.append(
+            {
+                "pred_len": pred_len,
+                "T": T,
+                "top_k": top_k,
+                "top_p": top_p,
+                "sample_count": sample_count,
+                "verbose": verbose,
+                "return_all_samples": return_all_samples,
+            }
+        )
         return generated
 
     predictor.generate = fake_generate
@@ -104,5 +114,53 @@ def test_predict_prepared_batch_matches_predict_batch():
         verbose=False,
     )
 
-    assert [df["close"].tolist() for df in direct] == [df["close"].tolist() for df in prepared_out]
-    assert [df.index.tolist() for df in direct] == [df.index.tolist() for df in prepared_out]
+    assert generate_calls == [
+        {
+            "pred_len": 2,
+            "T": 1.0,
+            "top_k": 1,
+            "top_p": 1.0,
+            "sample_count": 1,
+            "verbose": False,
+            "return_all_samples": False,
+        },
+        {
+            "pred_len": 2,
+            "T": 1.0,
+            "top_k": 1,
+            "top_p": 1.0,
+            "sample_count": 1,
+            "verbose": False,
+            "return_all_samples": False,
+        },
+    ]
+    for direct_df, prepared_df in zip(direct, prepared_out):
+        pd.testing.assert_frame_equal(direct_df, prepared_df)
+
+
+def test_predict_prepared_batch_validates_batch_sizes():
+    predictor = _make_predictor_stub()
+    x_batch = np.zeros((2, 3, 6), dtype=np.float32)
+    x_stamp_batch = np.zeros((2, 3, 5), dtype=np.float32)
+    y_stamp_batch = np.zeros((2, 2, 5), dtype=np.float32)
+    means = [np.zeros(6, dtype=np.float32)]
+    stds = [np.ones(6, dtype=np.float32), np.ones(6, dtype=np.float32)]
+    y_index_list = [
+        pd.Index(pd.bdate_range("2024-01-04", periods=2)),
+        pd.Index(pd.bdate_range("2024-01-04", periods=2)),
+    ]
+
+    try:
+        predictor.predict_prepared_batch(
+            x_batch,
+            x_stamp_batch,
+            y_stamp_batch,
+            means,
+            stds,
+            y_index_list,
+            pred_len=2,
+        )
+    except ValueError as exc:
+        assert "consistent batch sizes" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for mismatched prepared batch inputs")

@@ -644,6 +644,21 @@ class KronosPredictor:
         sample_count=1,
         verbose=True,
     ):
+        batch_size = x_batch.shape[0]
+        batch_sizes = [
+            batch_size,
+            x_stamp_batch.shape[0],
+            y_stamp_batch.shape[0],
+            len(means),
+            len(stds),
+            len(y_index_list),
+        ]
+        if len(set(batch_sizes)) != 1:
+            raise ValueError(
+                "Prepared batch inputs must have consistent batch sizes across x_batch, x_stamp_batch, "
+                "y_stamp_batch, means, stds, and y_index_list."
+            )
+
         preds = self.generate(x_batch, x_stamp_batch, y_stamp_batch, pred_len, T, top_k, top_p, sample_count, verbose)
 
         pred_dfs = []
