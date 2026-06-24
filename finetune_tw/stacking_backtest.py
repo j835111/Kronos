@@ -278,12 +278,14 @@ def _run_test_backtest(
 
     stacker_holdings: list[set[str]] = []
     kronos_holdings: list[set[str]] = []
+    kronos_mc_mean_holdings: list[set[str]] = []
     top_k = int(getattr(cfg, "top_k", 20))
 
     for date in dates:
         if feature_df.empty:
             stacker_holdings.append(set())
             kronos_holdings.append(set())
+            kronos_mc_mean_holdings.append(set())
             continue
 
         try:
@@ -291,6 +293,7 @@ def _run_test_backtest(
         except KeyError:
             stacker_holdings.append(set())
             kronos_holdings.append(set())
+            kronos_mc_mean_holdings.append(set())
             continue
 
         scores = stacking_model.predict(date_frame)
@@ -304,11 +307,18 @@ def _run_test_backtest(
             for _, sym in date_frame.index
             if (date, sym) in date_frame.index
         }
+        kronos_mc_mean_rank = {
+            sym: float(date_frame.loc[(date, sym), "kronos_mean"])
+            for _, sym in date_frame.index
+            if (date, sym) in date_frame.index
+        }
         stacker_holdings.append(rank_stocks(stacker_rank, top_k))
         kronos_holdings.append(rank_stocks(kronos_rank, top_k))
+        kronos_mc_mean_holdings.append(rank_stocks(kronos_mc_mean_rank, top_k))
 
     _, stacker_daily = build_portfolio_returns(close_prices, stacker_holdings, pd.DatetimeIndex(dates))
     _, kronos_daily = build_portfolio_returns(close_prices, kronos_holdings, pd.DatetimeIndex(dates))
+    _, kronos_mc_mean_daily = build_portfolio_returns(close_prices, kronos_mc_mean_holdings, pd.DatetimeIndex(dates))
 
     bench_frame = frames.get(benchmark_symbol, pd.DataFrame())
     if bench_frame.empty:
@@ -333,6 +343,11 @@ def _run_test_backtest(
             "daily_returns": kronos_daily.tolist(),
             "metrics": _compute_metrics_compat(kronos_daily),
         },
+        "kronos_mc_mean": {
+            "dates": [d.strftime("%Y-%m-%d") for d in kronos_mc_mean_daily.index],
+            "daily_returns": kronos_mc_mean_daily.tolist(),
+            "metrics": _compute_metrics_compat(kronos_mc_mean_daily),
+        },
         "benchmark": {
             "dates": [d.strftime("%Y-%m-%d") for d in benchmark_daily.index],
             "daily_returns": benchmark_daily.tolist(),
@@ -353,6 +368,7 @@ def _plot_stacking(data: dict, out_dir: Path, suffix: str = "") -> Path:
     colors = {
         "stacker": "#2196F3",
         "kronos_only": "#FF9800",
+        "kronos_mc_mean": "#4CAF50",
         "benchmark": "#9E9E9E",
     }
     for name, color in colors.items():
