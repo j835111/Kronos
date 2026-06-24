@@ -163,6 +163,8 @@ def _build_feature_table(
     symbols: list[str],
     dates: list[pd.Timestamp],
     include_target: bool,
+    partial_ckpt: Path | None = None,
+    checkpoint_every: int = 10,
 ) -> pd.DataFrame:
     if not dates:
         return _empty_feature_table(include_target)
@@ -177,13 +179,24 @@ def _build_feature_table(
     frames = _load_price_cache(cfg, all_symbols, min(dates), end)
     bench_frame = frames.get(benchmark_symbol, pd.DataFrame())
 
-    rows: list[dict[str, float | pd.Timestamp | str]] = []
     horizon = max(0, min(hold_days, int(getattr(cfg, "pred_len", hold_days))) - 1)
 
+    # Resume from partial checkpoint if available
+    rows: list[dict] = []
+    done_dates: set[pd.Timestamp] = set()
+    if partial_ckpt is not None and partial_ckpt.exists():
+        partial_df = pd.read_parquet(partial_ckpt)
+        done_dates = set(partial_df.index.get_level_values("date").unique())
+        rows = partial_df.reset_index().to_dict("records")
+        print(f"[stacking]   partial resume: {len(done_dates)} dates already done", flush=True)
+
+    pending = [d for d in dates if d not in done_dates]
     n_dates = len(dates)
-    for di, date in enumerate(dates):
-        if di % 20 == 0:
-            print(f"[stacking]   date {di+1}/{n_dates} ({date.date()})", flush=True)
+
+    for di, date in enumerate(pending):
+        abs_idx = len(done_dates) + di
+        if abs_idx % 20 == 0:
+            print(f"[stacking]   date {abs_idx+1}/{n_dates} ({date.date()})", flush=True)
         signals = extractor.extract_date(date, symbols, cfg, horizon=horizon)
         for sym in symbols:
             sym_frame = frames.get(sym, pd.DataFrame())
@@ -209,6 +222,13 @@ def _build_feature_table(
             row["symbol"] = sym
             rows.append(row)
 
+        # Save partial checkpoint every N dates
+        if partial_ckpt is not None and (di + 1) % checkpoint_every == 0:
+            _save_feature_table(
+                pd.DataFrame(rows).set_index(["date", "symbol"]).sort_index(),
+                partial_ckpt,
+            )
+
     if not rows:
         return _empty_feature_table(include_target)
 
@@ -221,6 +241,7 @@ def _collect_oof_features(
     engine: AnalogEngine | None,
     symbols: list[str],
     date_range,
+    partial_ckpt: Path | None = None,
 ) -> pd.DataFrame:
     inference_top_k = int(getattr(cfg, "mc_inference_top_k",
                                       max(int(getattr(cfg, "top_k", 20)) * 2, 40)))
@@ -230,7 +251,8 @@ def _collect_oof_features(
         top_k=inference_top_k,
     )
     dates = _normalize_dates(cfg, date_range)
-    return _build_feature_table(cfg, extractor, engine, symbols, dates, include_target=True)
+    return _build_feature_table(cfg, extractor, engine, symbols, dates, include_target=True,
+                                partial_ckpt=partial_ckpt)
 
 
 def _run_test_backtest(
@@ -454,16 +476,22 @@ def run_stacking_backtest(cfg: Config, force_retrain: bool = False, suffix: str 
         print(f"[stacking] {len(symbols)} symbols, {len(folds)} OOF folds", flush=True)
         for fi, fold in enumerate(folds):
             fold_ckpt = out_dir / f"stacking_oof_fold{fi+1}.parquet"
+            partial_ckpt = out_dir / f"stacking_oof_fold{fi+1}_partial.parquet"
             if not force_retrain and fold_ckpt.exists():
                 print(f"[stacking] fold {fi+1}/{len(folds)}: resuming from checkpoint {fold_ckpt.name}", flush=True)
                 fold_df = pd.read_parquet(fold_ckpt)
             else:
                 print(f"[stacking] fold {fi+1}/{len(folds)}: {fold.val_start} → {fold.val_end}", flush=True)
                 engine = _fit_analog_engine(cfg, symbols, fold.val_start)
-                fold_df = _collect_oof_features(cfg, predictor, engine, symbols, fold)
+                fold_df = _collect_oof_features(
+                    cfg, predictor, engine, symbols, fold,
+                    partial_ckpt=None if force_retrain else partial_ckpt,
+                )
                 print(f"[stacking] fold {fi+1} done: {len(fold_df)} rows", flush=True)
                 if not fold_df.empty:
                     _save_feature_table(fold_df, fold_ckpt)
+                if partial_ckpt.exists():
+                    partial_ckpt.unlink()
             if not fold_df.empty:
                 combined_oof.append(fold_df)
 
