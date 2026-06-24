@@ -77,4 +77,7 @@ tmp/
 
 finetune_tw/data/
 finetune_tw/outputs/
+# Stacking OOF checkpoints: committed explicitly for session persistence
+!finetune_tw/outputs/tw_daily/stacking_features_oof*.parquet
+!finetune_tw/outputs/tw_daily/stacking_model*.lgb
 .worktrees/
