@@ -300,3 +300,87 @@ def test_run_backtest_next_open_saves_suffix_outputs_and_schema(tmp_path, monkey
     }
     variant = data["hold_variants"]["2"]
     assert len(variant["dates"]) == len(variant["daily_returns"])
+
+
+def test_run_backtest_next_open_uses_exact_variant_schedule_for_non_multiple_holds(
+    tmp_path,
+    monkeypatch,
+):
+    import finetune_tw.backtest_next_open as bo
+
+    db_path = _seed_runner_db(tmp_path)
+    cfg = Config(
+        db_path=db_path,
+        benchmark_symbol="^TWII",
+        test_start_date="2024-01-01",
+        output_dir=str(tmp_path / "outputs"),
+        exp_name="next_open_case_non_multiple",
+        top_k=1,
+        min_signal_threshold=0.0,
+    )
+
+    monkeypatch.setattr(
+        bo,
+        "build_model_specs",
+        lambda _cfg: {
+            "round0": SimpleNamespace(label="Round 0"),
+        },
+    )
+    monkeypatch.setattr(bo, "load_predictor_from_spec", lambda spec, _cfg: object())
+    monkeypatch.setattr(bo, "_today", lambda: pd.Timestamp("2024-01-09"))
+    monkeypatch.setattr(
+        bo,
+        "compute_metrics",
+        lambda dr: {"annualised_return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0},
+    )
+    monkeypatch.setattr(
+        bo,
+        "plot_backtest_next_open_results",
+        lambda data, out_dir: out_dir / "backtest_round0_next_open.png",
+    )
+
+    seen_signal_dates = {}
+    seen_execution_dates = {}
+
+    def fake_compute_raw_signals(predictor, seen_cfg, signal_dates, pred_len, symbols):
+        assert seen_cfg is cfg
+        assert list(signal_dates.strftime("%Y-%m-%d")) == ["2024-01-02", "2024-01-08"]
+        assert pred_len == 5
+        assert symbols == ["1101.TW", "1216.TW"]
+        return {
+            d.strftime("%Y-%m-%d"): {
+                "1101.TW": pd.Series([0.01] * pred_len),
+                "1216.TW": pd.Series([0.02] * pred_len),
+            }
+            for d in signal_dates
+        }
+
+    def fake_signals_to_holdings(raw_preds, signal_dates, hold_days, top_k, threshold):
+        seen_signal_dates[hold_days] = list(signal_dates.strftime("%Y-%m-%d"))
+        return [{f"hold_{hold_days}"} for _ in signal_dates]
+
+    def fake_build_next_open_portfolio_returns(
+        price_frames,
+        holdings_sequence,
+        execution_dates,
+        trading_dates,
+    ):
+        hold_days = int(next(iter(holdings_sequence[0])).split("_")[1])
+        seen_execution_dates[hold_days] = list(execution_dates.strftime("%Y-%m-%d"))
+        daily = pd.Series([0.0], index=pd.DatetimeIndex([execution_dates[0]]))
+        return pd.Series(dtype=float), daily
+
+    monkeypatch.setattr(bo, "compute_raw_signals", fake_compute_raw_signals)
+    monkeypatch.setattr(bo, "signals_to_holdings", fake_signals_to_holdings)
+    monkeypatch.setattr(
+        bo,
+        "build_next_open_portfolio_returns",
+        fake_build_next_open_portfolio_returns,
+    )
+
+    bo.run_backtest_next_open(cfg, "round0", [3, 5])
+
+    assert seen_signal_dates[3] == ["2024-01-02", "2024-01-08"]
+    assert seen_execution_dates[3] == ["2024-01-03", "2024-01-09"]
+    assert seen_signal_dates[5] == ["2024-01-02"]
+    assert seen_execution_dates[5] == ["2024-01-03"]

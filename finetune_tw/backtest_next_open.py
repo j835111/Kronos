@@ -223,9 +223,11 @@ def plot_backtest_next_open_results(data: dict, out_dir: Path) -> Path:
         fontweight="bold",
     )
 
-    gs = fig.add_gridspec(2, max(n_holds, 2), hspace=0.38, wspace=0.32)
+    ncols = max(n_holds, 2)
+    cum_cols = 1 if ncols == 2 else n_holds // 2 + 1
+    gs = fig.add_gridspec(2, ncols, hspace=0.38, wspace=0.32)
 
-    ax_cum = fig.add_subplot(gs[0, : n_holds // 2 + 1])
+    ax_cum = fig.add_subplot(gs[0, :cum_cols])
     ax_cum.plot(
         bm_cum.index,
         bm_cum.values,
@@ -252,7 +254,7 @@ def plot_backtest_next_open_results(data: dict, out_dir: Path) -> Path:
     ax_cum.legend(fontsize=7.5, loc="upper left")
     ax_cum.set_title("Cumulative Returns", fontsize=10)
 
-    ax_bar = fig.add_subplot(gs[0, n_holds // 2 + 1 :])
+    ax_bar = fig.add_subplot(gs[0, cum_cols:])
     metric_names = ["Ann Return", "Sharpe", "Max DD"]
     x = np.arange(len(metric_names))
     bar_w = 0.8 / (n_holds + 1)
@@ -300,7 +302,6 @@ def run_backtest_next_open(cfg: Config, model_key: str, hold_days_list: list[int
     symbols = [s for s in list_symbols(cfg.db_path) if s != cfg.benchmark_symbol]
     test_end = str(_today().date())
     max_hold = max(hold_days_list)
-    min_hold = min(hold_days_list)
 
     print(f"\n{'=' * 60}")
     print(f"Model:  {spec.label}")
@@ -310,10 +311,14 @@ def run_backtest_next_open(cfg: Config, model_key: str, hold_days_list: list[int
     sys.stdout.flush()
 
     trading_dates = _load_trading_calendar(cfg, test_end)
-    signal_dates, execution_dates = _build_signal_and_execution_dates(
-        trading_dates,
-        hold_days=min_hold,
+    variant_schedules = {
+        hd: _build_signal_and_execution_dates(trading_dates, hold_days=hd)
+        for hd in hold_days_list
+    }
+    all_signal_dates = sorted(
+        {signal_date for signal_dates, _ in variant_schedules.values() for signal_date in signal_dates}
     )
+    signal_dates = pd.DatetimeIndex(all_signal_dates)
     price_frames = _load_price_frames(cfg, symbols, test_end)
     print(f"Loaded open/close prices: {len(price_frames)} symbols")
     sys.stdout.flush()
@@ -338,9 +343,7 @@ def run_backtest_next_open(cfg: Config, model_key: str, hold_days_list: list[int
 
     hold_variants: dict[str, dict] = {}
     for hd in hold_days_list:
-        step = hd // min_hold
-        variant_signal_dates = signal_dates[::step]
-        variant_execution_dates = execution_dates[::step]
+        variant_signal_dates, variant_execution_dates = variant_schedules[hd]
         holdings = signals_to_holdings(
             raw_preds,
             variant_signal_dates,
