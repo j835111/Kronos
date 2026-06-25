@@ -111,3 +111,69 @@ def test_build_next_open_portfolio_returns_combines_gap_and_rebalance_intraday()
     assert daily_returns.iloc[2] == pytest.approx(0.10)
     assert len(period_returns) == 1
     assert period_returns.iloc[0] == pytest.approx(0.10)
+
+
+def test_build_next_open_portfolio_returns_single_execution_emits_first_intraday():
+    import finetune_tw.backtest_next_open as bo
+
+    trading_dates = pd.DatetimeIndex(["2024-01-03"])
+    execution_dates = pd.DatetimeIndex(["2024-01-03"])
+    holdings = [{"A"}]
+
+    price_frames = {
+        "A": pd.DataFrame(
+            {
+                "open": [100.0],
+                "close": [110.0],
+            },
+            index=trading_dates,
+        ),
+    }
+
+    period_returns, daily_returns = bo.build_next_open_portfolio_returns(
+        price_frames=price_frames,
+        holdings_sequence=holdings,
+        execution_dates=execution_dates,
+        trading_dates=trading_dates,
+    )
+
+    assert period_returns.empty
+    assert list(daily_returns.index.strftime("%Y-%m-%d")) == ["2024-01-03"]
+    assert daily_returns.iloc[0] == pytest.approx(0.10)
+
+
+def test_build_next_open_portfolio_returns_preserves_zero_period_when_outgoing_missing():
+    import finetune_tw.backtest_next_open as bo
+
+    trading_dates = pd.DatetimeIndex(["2024-01-03", "2024-01-05"])
+    execution_dates = pd.DatetimeIndex(["2024-01-03", "2024-01-05"])
+    holdings = [{"A"}, {"B"}]
+
+    price_frames = {
+        "A": pd.DataFrame(
+            {
+                "open": [100.0],
+                "close": [110.0],
+            },
+            index=pd.DatetimeIndex(["2024-01-03"]),
+        ),
+        "B": pd.DataFrame(
+            {
+                "open": [50.0],
+                "close": [55.0],
+            },
+            index=pd.DatetimeIndex(["2024-01-05"]),
+        ),
+    }
+
+    period_returns, daily_returns = bo.build_next_open_portfolio_returns(
+        price_frames=price_frames,
+        holdings_sequence=holdings,
+        execution_dates=execution_dates,
+        trading_dates=trading_dates,
+    )
+
+    assert list(daily_returns.index.strftime("%Y-%m-%d")) == ["2024-01-03"]
+    assert daily_returns.iloc[0] == pytest.approx(0.10)
+    assert list(period_returns.index.strftime("%Y-%m-%d")) == ["2024-01-03"]
+    assert period_returns.iloc[0] == pytest.approx(0.0)

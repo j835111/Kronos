@@ -97,8 +97,6 @@ def build_next_open_portfolio_returns(
         raise ValueError(
             "holdings_sequence and execution_dates must have the same length."
         )
-    if len(execution_dates) < 2:
-        return pd.Series(dtype=float), pd.Series(dtype=float)
 
     daily_values: list[float] = []
     daily_index: list[pd.Timestamp] = []
@@ -169,9 +167,8 @@ def build_next_open_portfolio_returns(
             current_exec,
             "open",
         )
-        if period_return is not None:
-            period_values.append(period_return)
-            period_index.append(current_exec)
+        period_values.append(period_return if period_return is not None else 0.0)
+        period_index.append(current_exec)
 
     return (
         pd.Series(period_values, index=pd.DatetimeIndex(period_index), dtype=float),
