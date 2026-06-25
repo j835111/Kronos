@@ -4,6 +4,7 @@ import pandas as pd
 
 from finetune_tw.config import Config
 from finetune_tw.db import init_db, upsert_prices
+import pytest
 
 
 def _seed_calendar_db(tmp_path) -> str:
@@ -60,3 +61,52 @@ def test_build_signal_and_execution_dates_drops_last_anchor_without_next_day():
 
     assert list(signal_dates.strftime("%Y-%m-%d")) == ["2024-01-02", "2024-01-05"]
     assert list(execution_dates.strftime("%Y-%m-%d")) == ["2024-01-03", "2024-01-08"]
+
+
+def test_build_next_open_portfolio_returns_combines_gap_and_rebalance_intraday():
+    import finetune_tw.backtest_next_open as bo
+
+    trading_dates = pd.DatetimeIndex(["2024-01-03", "2024-01-04", "2024-01-05"])
+    execution_dates = pd.DatetimeIndex(["2024-01-03", "2024-01-05"])
+    holdings = [{"A", "B"}, {"C"}]
+
+    price_frames = {
+        "A": pd.DataFrame(
+            {
+                "open": [100.0, 110.0, 121.0],
+                "close": [110.0, 121.0, 133.1],
+            },
+            index=trading_dates,
+        ),
+        "B": pd.DataFrame(
+            {
+                "open": [200.0, 220.0, 198.0],
+                "close": [220.0, 198.0, 217.8],
+            },
+            index=trading_dates,
+        ),
+        "C": pd.DataFrame(
+            {
+                "open": [50.0, 50.0, 50.0],
+                "close": [50.0, 50.0, 55.0],
+            },
+            index=trading_dates,
+        ),
+    }
+
+    period_returns, daily_returns = bo.build_next_open_portfolio_returns(
+        price_frames=price_frames,
+        holdings_sequence=holdings,
+        execution_dates=execution_dates,
+        trading_dates=trading_dates,
+    )
+
+    assert list(daily_returns.index.strftime("%Y-%m-%d")) == [
+        "2024-01-03",
+        "2024-01-04",
+        "2024-01-05",
+    ]
+    assert daily_returns.iloc[0] == pytest.approx(0.10)
+    assert daily_returns.iloc[1] == pytest.approx(0.0)
+    assert daily_returns.iloc[2] == pytest.approx((1.05 * 1.10) - 1.0)
+    assert len(period_returns) == 1
