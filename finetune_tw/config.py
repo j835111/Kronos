@@ -59,17 +59,6 @@ class Config:
     benchmark_symbol: str = "^TWII"
     min_signal_threshold: float = 0.0  # skip stocks with predicted return below this; 0.0 = only positive
 
-    # Stacking meta-model
-    mc_sample_count: int = 20
-    mc_candidate_k: int = 0  # if >0, run MC only on top-k symbols by greedy signal (speeds up test phase)
-    stacking_enabled: bool = False
-    stacking_train_start: str = "2018-01-01"
-    stacking_train_end: str = "2023-12-31"
-    wf_embargo_days: int = 110
-    analog_enabled: bool = False
-    analog_n_neighbors: int = 20
-    analog_window: int = 20
-
     @classmethod
     def from_yaml(cls, path: str) -> "Config":
         with open(path) as f:
