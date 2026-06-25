@@ -93,34 +93,12 @@ python -m finetune_tw.grid_search_backtest --config $CONFIG --model round0 \
 # 1. Pull 最新程式碼與 DB（fork remote = j835111/Kronos）
 git -C /marimo/Kronos pull fork master
 
-# 2. 安裝 lightgbm（如未安裝）
-uv pip install lightgbm>=4.0
-
-# 3. 需要 HF 登入（下載 predictor checkpoint）
+# 2. 需要 HF 登入（下載 predictor checkpoint）
 huggingface-cli login   # 或設定 HF_TOKEN 環境變數
 ```
 
 > **注意**：VM filesystem（`/home/marimo/`、`/tmp/` 等）每次 sandbox 重啟會清空。`/mnt/first/` 換 PV 時也會清空，不可靠。資料一律放在 `/marimo/Kronos/` 下。
 > **DB 已在 git**：`finetune_tw/data/tw_stocks.db`（274 支股票，2015-01-05 → 最新），不需要執行 `download_data`。
-
-### Stacking Backtest (MoLab)
-
-```bash
-CONFIG=finetune_tw/configs/config_tw_daily_rtx6000.yaml
-
-# 6. Stacking backtest（需先 HF 登入，config 已設 stacking_enabled: true）：
-python -m finetune_tw.stacking_backtest --config $CONFIG --model round0
-```
-
-**Stacking config 欄位（已寫入 config_tw_daily_rtx6000.yaml）：**
-
-| 欄位 | 值 | 說明 |
-|------|-----|------|
-| `stacking_enabled` | `true` | 啟用 stacking |
-| `mc_sample_count` | `10` | MC 採樣次數 |
-| `analog_enabled` | `false` | 第一輪不開 Analog Engine |
-| `stacking_train_start` | `2018-01-01` | OOF 訓練起始 |
-| `stacking_train_end` | `2023-12-31` | OOF 訓練結束 |
 
 ### Finetune (Taiwan stocks / Colab)
 使用 `finetune_tw/colab_setup.ipynb`，按 cell 順序執行：
