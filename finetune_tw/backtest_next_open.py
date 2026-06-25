@@ -122,7 +122,6 @@ def build_next_open_portfolio_returns(
         next_exec = execution_dates[i + 1]
         current_holdings = holdings_sequence[i]
         next_holdings = holdings_sequence[i + 1]
-        period_start = len(daily_values)
 
         interior_dates = trading_dates[
             (trading_dates > current_exec) & (trading_dates < next_exec)
@@ -158,25 +157,20 @@ def build_next_open_portfolio_returns(
             next_exec,
             "open",
         )
-        outgoing_rebalance_intraday = _mean_symbol_return(
-            price_frames,
-            current_holdings,
-            next_exec,
-            "close",
-            next_exec,
-            "open",
-        )
-        if gap is not None and outgoing_rebalance_intraday is not None:
-            gap = float(np.mean([gap, outgoing_rebalance_intraday]))
         if gap is not None and intraday is not None:
             daily_values.append((1.0 + gap) * (1.0 + intraday) - 1.0)
             daily_index.append(next_exec)
 
-        if len(daily_values) > period_start:
-            compounded = float(
-                np.prod([1.0 + x for x in daily_values[period_start:]]) - 1.0
-            )
-            period_values.append(compounded)
+        period_return = _mean_symbol_return(
+            price_frames,
+            current_holdings,
+            next_exec,
+            "open",
+            current_exec,
+            "open",
+        )
+        if period_return is not None:
+            period_values.append(period_return)
             period_index.append(current_exec)
 
     return (

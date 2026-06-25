@@ -108,5 +108,6 @@ def test_build_next_open_portfolio_returns_combines_gap_and_rebalance_intraday()
     ]
     assert daily_returns.iloc[0] == pytest.approx(0.10)
     assert daily_returns.iloc[1] == pytest.approx(0.0)
-    assert daily_returns.iloc[2] == pytest.approx((1.05 * 1.10) - 1.0)
+    assert daily_returns.iloc[2] == pytest.approx(0.10)
     assert len(period_returns) == 1
+    assert period_returns.iloc[0] == pytest.approx(0.10)
