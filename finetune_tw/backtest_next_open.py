@@ -17,7 +17,6 @@ import torch
 from finetune_tw.backtest import (
     build_model_specs,
     compute_metrics,
-    compute_raw_signals,
     load_predictor_from_spec,
     rank_stocks,
     signals_to_holdings,
@@ -81,6 +80,67 @@ def _load_price_frames(
         frame = frame.set_index("date").sort_index()
         price_frames[sym] = frame
     return price_frames
+
+
+def compute_raw_signals_open(
+    predictor,
+    cfg: Config,
+    rebal_dates: pd.DatetimeIndex,
+    pred_len: int,
+    symbols: list[str],
+) -> dict[str, dict[str, pd.Series]]:
+    """Like compute_raw_signals but ranks by predicted open[T+h+1]/open[T+1]-1.
+
+    pred_len must be max_hold + 1 so iloc[h] is available for each hold variant h.
+    The returned Series has length pred_len-1, where iloc[h-1] = open[T+h+1]/open[T+1]-1,
+    aligning exactly with next-open execution for hold=h days.
+    """
+    BATCH_SIZE = 64
+    raw_preds: dict[str, dict[str, pd.Series]] = {}
+
+    for i, rebal_date in enumerate(rebal_dates):
+        rebal_str = rebal_date.strftime("%Y-%m-%d")
+        lookback_start = (rebal_date - pd.Timedelta(days=cfg.lookback_window * 2)).strftime("%Y-%m-%d")
+        y_ts = pd.date_range(rebal_date, periods=pred_len, freq="B")
+
+        batch_syms, batch_dfs, batch_xts, batch_yts = [], [], [], []
+        for sym in symbols:
+            df = query_symbol(cfg.db_path, sym, start=lookback_start, end=rebal_str)
+            if len(df) < cfg.lookback_window:
+                continue
+            ctx = df.iloc[-cfg.lookback_window:]
+            ctx_df = ctx[["open", "high", "low", "close", "volume", "amount"]].reset_index(drop=True)
+            if ctx_df.isnull().any().any():
+                continue
+            batch_syms.append(sym)
+            batch_dfs.append(ctx_df)
+            batch_xts.append(pd.to_datetime(ctx["date"]).reset_index(drop=True))
+            batch_yts.append(pd.Series(y_ts))
+
+        date_preds: dict[str, pd.Series] = {}
+        with torch.no_grad():
+            for b in range(0, len(batch_syms), BATCH_SIZE):
+                preds = predictor.predict_batch(
+                    df_list=batch_dfs[b : b + BATCH_SIZE],
+                    x_timestamp_list=batch_xts[b : b + BATCH_SIZE],
+                    y_timestamp_list=batch_yts[b : b + BATCH_SIZE],
+                    pred_len=pred_len,
+                    T=1.0, top_k=1, top_p=1.0, sample_count=1, verbose=False,
+                )
+                for sym, pred in zip(batch_syms[b : b + BATCH_SIZE], preds):
+                    if pred is not None and len(pred) >= pred_len:
+                        pred_opens = pred["open"].reset_index(drop=True)
+                        # iloc[h-1] = open[T+h+1] / open[T+1] - 1
+                        date_preds[sym] = (
+                            pred_opens.iloc[1:].reset_index(drop=True) / pred_opens.iloc[0] - 1
+                        )
+
+        raw_preds[rebal_str] = date_preds
+        if (i + 1) % 5 == 0 or i == 0:
+            print(f"  [{i+1}/{len(rebal_dates)}] {rebal_str}: {len(date_preds)} signals")
+            sys.stdout.flush()
+
+    return raw_preds
 
 
 def _mean_symbol_return(
@@ -303,9 +363,11 @@ def run_backtest_next_open(cfg: Config, model_key: str, hold_days_list: list[int
     test_end = str(_today().date())
     max_hold = max(hold_days_list)
 
+    pred_len = max_hold + 1  # +1 so open[T+h+1] is available for hold=h
+
     print(f"\n{'=' * 60}")
     print(f"Model:  {spec.label}")
-    print(f"Hold variants: {hold_days_list}  |  pred_len={max_hold}")
+    print(f"Hold variants: {hold_days_list}  |  pred_len={pred_len}  (open-to-open signal)")
     print(f"Period: {cfg.test_start_date} → {test_end}")
     print(f"{'=' * 60}")
     sys.stdout.flush()
@@ -337,7 +399,7 @@ def run_backtest_next_open(cfg: Config, model_key: str, hold_days_list: list[int
     predictor = load_predictor_from_spec(spec, cfg)
     print(f"Inference: {len(signal_dates)} periods × {len(symbols)} symbols")
     sys.stdout.flush()
-    raw_preds = compute_raw_signals(predictor, cfg, signal_dates, max_hold, symbols)
+    raw_preds = compute_raw_signals_open(predictor, cfg, signal_dates, pred_len, symbols)
     del predictor
     torch.cuda.empty_cache()
 
