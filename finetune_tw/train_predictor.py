@@ -87,6 +87,34 @@ def _resolve_amp(amp_dtype: str) -> tuple[bool, "torch.dtype | None"]:
     return False, None
 
 
+def differentiable_rank_ic_loss(
+    pred_scores: torch.Tensor,
+    actual_scores: torch.Tensor,
+) -> torch.Tensor:
+    if pred_scores.numel() < 2 or actual_scores.numel() < 2:
+        return pred_scores.new_tensor(0.0)
+
+    pred = pred_scores.reshape(-1).to(torch.float32)
+    actual = actual_scores.reshape(-1).to(torch.float32)
+    z_pred = (pred - pred.mean()) / (pred.std(unbiased=False) + 1e-8)
+    z_actual = (actual - actual.mean()) / (actual.std(unbiased=False) + 1e-8)
+    return -(z_pred * z_actual).mean()
+
+
+def _combine_training_loss(
+    token_loss: torch.Tensor,
+    ranking_loss_alpha: float,
+    ranking_loss: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if ranking_loss_alpha > 0:
+        if ranking_loss is None:
+            ranking_loss = token_loss.new_tensor(0.0)
+        else:
+            ranking_loss = ranking_loss.to(device=token_loss.device, dtype=token_loss.dtype)
+        return token_loss + ranking_loss_alpha * ranking_loss
+    return token_loss
+
+
 class CachedTokenDataset(Dataset):
     def __init__(self, cache_file: Path) -> None:
         payload = torch.load(cache_file, map_location="cpu", weights_only=True)
@@ -372,16 +400,17 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
             ):
                 logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
                 loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+                total_loss = _combine_training_loss(loss, cfg.ranking_loss_alpha)
 
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:
-                scaler.scale(loss).backward()
+                scaler.scale(total_loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 3.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                loss.backward()
+                total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 3.0)
                 optimizer.step()
             scheduler.step()

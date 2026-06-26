@@ -39,6 +39,8 @@ class Config:
     ic_val_symbols: int = 150
     ic_val_dates: int = 8
     val_ic_horizons: int = 5
+    ranking_loss_alpha: float = 0.0
+    ranking_loss_horizon: int = 5
 
     # Model paths
     pretrained_tokenizer: str = "NeoQuasar/Kronos-Tokenizer-base"

@@ -32,6 +32,8 @@ seed: 42
 early_stop_patience: 3
 ic_val_symbols: 300
 ic_val_dates: 20
+ranking_loss_alpha: 0.0
+ranking_loss_horizon: 5
 
 pretrained_tokenizer: "NeoQuasar/Kronos-Tokenizer-base"
 pretrained_predictor: "j835111/kronos-tw-finetune"
@@ -46,4 +48,3 @@ hold_days: 3
 pred_len: 10
 test_start_date: "2024-07-01"
 benchmark_symbol: "^TWII"
-
