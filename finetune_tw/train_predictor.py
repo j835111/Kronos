@@ -27,7 +27,13 @@ from finetune_tw.ic_validation import (
     validate_predictor_ic,
     validate_predictor_ic_ir,
 )
-from finetune_tw.hf_utils import push_best_model, push_file, wait_for_pushes
+from finetune_tw.hf_utils import (
+    push_best_model,
+    push_checkpoint,
+    push_file,
+    restore_checkpoints,
+    wait_for_pushes,
+)
 from finetune_tw.train_tokenizer import _load_latest_checkpoint, _save_checkpoint
 
 
@@ -76,6 +82,42 @@ def _gdrive_sync_checkpoint(ckpt_path: Path, remote_ckpt_dir: str) -> None:
         ["rclone", "copy", str(ckpt_path), remote_ckpt_dir, "--transfers=4"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
+
+
+def _restore_predictor_training_state(
+    cfg: Config,
+    save_dir: Path,
+    ckpt_dir: Path,
+    remote_root: str,
+    model,
+    optimizer,
+    scheduler,
+):
+    _gdrive_restore_checkpoints(ckpt_dir, f"{remote_root}/checkpoints")
+    if (
+        not list(ckpt_dir.glob("ckpt-*.pt"))
+        and cfg.hf_repo
+        and cfg.hf_checkpoint_revision_out
+    ):
+        restore_checkpoints(
+            save_dir,
+            cfg.hf_repo,
+            "predictor/checkpoints",
+            cfg.hf_checkpoint_revision_out,
+        )
+    return _load_latest_checkpoint(ckpt_dir, model, optimizer, scheduler)
+
+
+def _backup_predictor_checkpoint(cfg: Config, ckpt_path: Path, remote_root: str) -> None:
+    _gdrive_sync_checkpoint(ckpt_path, f"{remote_root}/checkpoints")
+    if cfg.hf_repo and cfg.hf_checkpoint_revision_out:
+        push_checkpoint(
+            ckpt_path,
+            cfg.hf_repo,
+            f"predictor/checkpoints/{ckpt_path.name}",
+            cfg.hf_checkpoint_revision_out,
+            cfg.hf_checkpoint_keep_last_n,
+        )
 
 
 def _resolve_amp(amp_dtype: str) -> tuple[bool, "torch.dtype | None"]:
@@ -348,8 +390,15 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
         steps_per_epoch=train_steps_per_epoch, epochs=cfg.basemodel_epochs,
         pct_start=0.03, div_factor=10,
     )
-    _gdrive_restore_checkpoints(ckpt_dir, f"{remote_root}/checkpoints")
-    start_epoch, global_step = _load_latest_checkpoint(ckpt_dir, model, optimizer, scheduler)
+    start_epoch, global_step = _restore_predictor_training_state(
+        cfg,
+        save_dir=save_dir,
+        ckpt_dir=ckpt_dir,
+        remote_root=remote_root,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+    )
     log_path = save_dir / "train_log.csv"
     if not log_path.exists():
         log_path.write_text("epoch,step,train_loss,val_loss,val_ic,ic_ir_h5\n")
@@ -421,7 +470,11 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
 
             if global_step % cfg.save_steps == 0:
                 _save_checkpoint(ckpt_dir, global_step, epoch, model, optimizer, scheduler)
-                _gdrive_sync_checkpoint(ckpt_dir / f"ckpt-{global_step}.pt", f"{remote_root}/checkpoints")
+                _backup_predictor_checkpoint(
+                    cfg,
+                    ckpt_path=ckpt_dir / f"ckpt-{global_step}.pt",
+                    remote_root=remote_root,
+                )
 
             if max_steps > 0 and global_step >= max_steps:
                 return

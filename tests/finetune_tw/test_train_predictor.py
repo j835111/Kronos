@@ -6,6 +6,8 @@ from finetune_tw.config import Config
 from finetune_tw.db import init_db, upsert_prices
 from finetune_tw.train_predictor import (
     _build_ctx_for_date,
+    _backup_predictor_checkpoint,
+    _restore_predictor_training_state,
     _resolve_amp,
     _steps_for_epoch,
     _token_cache_paths,
@@ -114,3 +116,120 @@ def test_token_cache_paths_are_split_specific(tmp_path):
 
 def test_predictor_steps_for_epoch_uses_cap():
     assert _steps_for_epoch(500, 120) == 120
+
+
+def test_restore_predictor_training_state_prefers_local_checkpoint(tmp_path, monkeypatch):
+    ckpt_dir = tmp_path / "predictor" / "checkpoints"
+    ckpt_dir.mkdir(parents=True)
+    (ckpt_dir / "ckpt-10.pt").write_bytes(b"x")
+    calls = []
+
+    def fake_gdrive_restore(path, remote):
+        calls.append(("gdrive", path, remote))
+
+    def fake_hf_restore(*args, **kwargs):
+        calls.append(("hf", args, kwargs))
+        return 1
+
+    def fake_load(path, model, optimizer, scheduler):
+        calls.append(("load", path))
+        return 3, 10
+
+    monkeypatch.setattr("finetune_tw.train_predictor._gdrive_restore_checkpoints", fake_gdrive_restore)
+    monkeypatch.setattr("finetune_tw.train_predictor.restore_checkpoints", fake_hf_restore)
+    monkeypatch.setattr("finetune_tw.train_predictor._load_latest_checkpoint", fake_load)
+
+    cfg = Config()
+    state = _restore_predictor_training_state(
+        cfg,
+        save_dir=tmp_path / "predictor",
+        ckpt_dir=ckpt_dir,
+        remote_root="gdrive:Kronos/outputs/test/predictor",
+        model=object(),
+        optimizer=object(),
+        scheduler=object(),
+    )
+
+    assert state == (3, 10)
+    assert calls == [
+        ("gdrive", ckpt_dir, "gdrive:Kronos/outputs/test/predictor/checkpoints"),
+        ("load", ckpt_dir),
+    ]
+
+
+def test_restore_predictor_training_state_uses_hf_when_local_missing(tmp_path, monkeypatch):
+    save_dir = tmp_path / "predictor"
+    ckpt_dir = save_dir / "checkpoints"
+    calls = []
+
+    def fake_gdrive_restore(path, remote):
+        calls.append(("gdrive", path, remote))
+
+    def fake_hf_restore(exp_dir, repo_id, subfolder, revision):
+        calls.append(("hf", exp_dir, repo_id, subfolder, revision))
+        return 1
+
+    def fake_load(path, model, optimizer, scheduler):
+        calls.append(("load", path))
+        return 4, 20
+
+    monkeypatch.setattr("finetune_tw.train_predictor._gdrive_restore_checkpoints", fake_gdrive_restore)
+    monkeypatch.setattr("finetune_tw.train_predictor.restore_checkpoints", fake_hf_restore)
+    monkeypatch.setattr("finetune_tw.train_predictor._load_latest_checkpoint", fake_load)
+
+    cfg = Config(hf_repo="org/repo", hf_checkpoint_revision_out="checkpoints-round-3")
+    state = _restore_predictor_training_state(
+        cfg,
+        save_dir=save_dir,
+        ckpt_dir=ckpt_dir,
+        remote_root="gdrive:Kronos/outputs/test/predictor",
+        model=object(),
+        optimizer=object(),
+        scheduler=object(),
+    )
+
+    assert state == (4, 20)
+    assert calls == [
+        ("gdrive", ckpt_dir, "gdrive:Kronos/outputs/test/predictor/checkpoints"),
+        ("hf", save_dir, "org/repo", "predictor/checkpoints", "checkpoints-round-3"),
+        ("load", ckpt_dir),
+    ]
+
+
+def test_backup_predictor_checkpoint_pushes_gdrive_and_hf_when_configured(tmp_path, monkeypatch):
+    ckpt_path = tmp_path / "predictor" / "checkpoints" / "ckpt-30.pt"
+    ckpt_path.parent.mkdir(parents=True)
+    ckpt_path.write_bytes(b"x")
+    calls = []
+
+    def fake_gdrive_sync(path, remote):
+        calls.append(("gdrive", path, remote))
+
+    def fake_push_checkpoint(local_path, repo_id, path_in_repo, revision, keep_last_n):
+        calls.append(("hf", local_path, repo_id, path_in_repo, revision, keep_last_n))
+
+    monkeypatch.setattr("finetune_tw.train_predictor._gdrive_sync_checkpoint", fake_gdrive_sync)
+    monkeypatch.setattr("finetune_tw.train_predictor.push_checkpoint", fake_push_checkpoint)
+
+    cfg = Config(
+        hf_repo="org/repo",
+        hf_checkpoint_revision_out="checkpoints-round-3",
+        hf_checkpoint_keep_last_n=7,
+    )
+    _backup_predictor_checkpoint(
+        cfg,
+        ckpt_path=ckpt_path,
+        remote_root="gdrive:Kronos/outputs/test/predictor",
+    )
+
+    assert calls == [
+        ("gdrive", ckpt_path, "gdrive:Kronos/outputs/test/predictor/checkpoints"),
+        (
+            "hf",
+            ckpt_path,
+            "org/repo",
+            "predictor/checkpoints/ckpt-30.pt",
+            "checkpoints-round-3",
+            7,
+        ),
+    ]
