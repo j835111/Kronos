@@ -142,8 +142,31 @@ def test_build_validation_contexts_uses_single_window_query(monkeypatch):
     contexts = _build_validation_contexts(cfg, val_universe, val_dates)
 
     assert len(calls) == 1
+    assert calls[0][0] == cfg.db_path
+    assert calls[0][1] == val_universe
+    assert calls[0][2] == (
+        min(val_dates) - pd.Timedelta(days=cfg.lookback_window * 2)
+    ).strftime("%Y-%m-%d")
+    assert calls[0][3] == max(val_dates).strftime("%Y-%m-%d")
     assert set(contexts) == set(pd.to_datetime(val_dates))
     assert [symbol for symbol, *_ in contexts[pd.Timestamp("2024-01-04")]] == ["AAA", "BBB"]
+
+
+def test_build_validation_contexts_returns_empty_lists_when_query_is_empty(monkeypatch):
+    def fake_query_symbols_window(db_path, symbols, start=None, end=None):
+        return pd.DataFrame(
+            columns=["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
+        )
+
+    monkeypatch.setattr("finetune_tw.train_predictor.query_symbols_window", fake_query_symbols_window)
+
+    cfg = Config(db_path="ignored", lookback_window=3, pred_len=2)
+    val_universe = ["AAA", "BBB"]
+    val_dates = pd.to_datetime(["2024-01-04", "2024-01-05"])
+
+    contexts = _build_validation_contexts(cfg, val_universe, val_dates)
+
+    assert contexts == {pd.Timestamp(date): [] for date in val_dates}
 
 
 def test_build_validation_contexts_skips_short_or_null_contexts(monkeypatch):
