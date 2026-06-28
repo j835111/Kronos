@@ -96,7 +96,13 @@ def _collect_rows_for_date(predict_batch_fn, val_universe, date, cfg, build_ctx_
     ).get(pd.Timestamp(date), [])
 
 
-def collect_validation_rows_by_date(predict_batch_fn, contexts_by_date, cfg, batch_size=64):
+def collect_validation_rows_by_date(
+    predict_batch_fn,
+    contexts_by_date,
+    cfg,
+    batch_size=64,
+    prepared_batch_predict_fn=None,
+):
     """Collect predictor rows once per date from prepared validation contexts."""
     required_pred_len = min(getattr(cfg, "val_ic_horizons", cfg.pred_len), cfg.pred_len - 1) + 1
     rows_by_date = {}
@@ -107,6 +113,7 @@ def collect_validation_rows_by_date(predict_batch_fn, contexts_by_date, cfg, bat
             continue
 
         syms, dfs, x_timestamps, y_timestamps, last_dates = [], [], [], [], []
+        x_stamps, y_stamps = [], []
         for context in contexts:
             sym, ctx_df, x_ts, y_ts, last_date = context[:5]
             syms.append(sym)
@@ -114,16 +121,41 @@ def collect_validation_rows_by_date(predict_batch_fn, contexts_by_date, cfg, bat
             x_timestamps.append(x_ts)
             y_timestamps.append(y_ts)
             last_dates.append(last_date)
+            if len(context) >= 7:
+                x_stamps.append(context[-2])
+                y_stamps.append(context[-1])
+            else:
+                x_stamps.append(None)
+                y_stamps.append(None)
 
         rows = []
         for start in range(0, len(syms), batch_size):
             stop = start + batch_size
-            preds = predict_batch_fn(
-                dfs[start:stop],
-                x_timestamps[start:stop],
-                y_timestamps[start:stop],
-                cfg.pred_len,
-            )
+            df_slice = dfs[start:stop]
+            x_timestamp_slice = x_timestamps[start:stop]
+            y_timestamp_slice = y_timestamps[start:stop]
+            x_stamp_slice = x_stamps[start:stop]
+            y_stamp_slice = y_stamps[start:stop]
+            if (
+                prepared_batch_predict_fn is not None
+                and all(x_stamp is not None for x_stamp in x_stamp_slice)
+                and all(y_stamp is not None for y_stamp in y_stamp_slice)
+            ):
+                preds = prepared_batch_predict_fn(
+                    df_slice,
+                    x_timestamp_slice,
+                    y_timestamp_slice,
+                    cfg.pred_len,
+                    x_stamp_slice,
+                    y_stamp_slice,
+                )
+            else:
+                preds = predict_batch_fn(
+                    df_slice,
+                    x_timestamp_slice,
+                    y_timestamp_slice,
+                    cfg.pred_len,
+                )
             for offset, pred in enumerate(preds):
                 if pred is None:
                     continue

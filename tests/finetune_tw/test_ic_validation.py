@@ -187,6 +187,60 @@ def test_collect_rows_by_date_batches_once_per_date():
     }
 
 
+def test_collect_rows_by_date_uses_prepared_batch_callback_with_precomputed_stamps():
+    cfg = SimpleNamespace(pred_len=3, val_ic_horizons=2)
+    x_stamp = np.ones((2, 5), dtype=np.float32)
+    y_stamp = np.full((3, 5), 2.0, dtype=np.float32)
+    contexts_by_date = {
+        pd.Timestamp("2024-01-03"): [
+            ("AAA", *_make_ctx(last_date="2024-01-02", ctx_ref=10.0), x_stamp, y_stamp),
+            ("BBB", *_make_ctx(last_date="2024-01-02", ctx_ref=11.0), x_stamp * 3, y_stamp),
+        ],
+    }
+    pred_df = pd.DataFrame({"open": [11.0, 12.0, 13.0], "close": [11.0, 12.0, 13.0]})
+    legacy_calls = []
+    prepared_calls = []
+
+    def predict_batch_fn(df_list, x_timestamp_list, y_timestamp_list, pred_len):
+        legacy_calls.append((df_list, x_timestamp_list, y_timestamp_list, pred_len))
+        return [pred_df.copy() for _ in df_list]
+
+    def prepared_batch_predict_fn(
+        df_list,
+        x_timestamp_list,
+        y_timestamp_list,
+        pred_len,
+        x_stamp_list,
+        y_stamp_list,
+    ):
+        prepared_calls.append(
+            {
+                "batch_size": len(df_list),
+                "pred_len": pred_len,
+                "x_stamp_list": x_stamp_list,
+                "y_stamp_list": y_stamp_list,
+            }
+        )
+        return [pred_df.copy() for _ in df_list]
+
+    rows_by_date = collect_validation_rows_by_date(
+        predict_batch_fn,
+        contexts_by_date,
+        cfg,
+        prepared_batch_predict_fn=prepared_batch_predict_fn,
+    )
+
+    assert legacy_calls == []
+    assert len(prepared_calls) == 1
+    assert prepared_calls[0]["batch_size"] == 2
+    assert prepared_calls[0]["pred_len"] == cfg.pred_len
+    assert prepared_calls[0]["x_stamp_list"][0] is x_stamp
+    assert prepared_calls[0]["x_stamp_list"][1] is not x_stamp
+    assert prepared_calls[0]["y_stamp_list"][0] is y_stamp
+    assert prepared_calls[0]["y_stamp_list"][1] is y_stamp
+    assert len(rows_by_date[pd.Timestamp("2024-01-03")]) == 2
+
+
 def test_compute_validation_metrics_reuses_rows_for_both_outputs():
     cfg = SimpleNamespace(pred_len=3, val_ic_horizons=2)
     val_dates = pd.to_datetime(["2024-01-03", "2024-01-04", "2024-01-05"])

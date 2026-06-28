@@ -1,5 +1,6 @@
 import torch
 import pandas as pd
+import numpy as np
 from pathlib import Path
 
 from finetune_tw.config import Config
@@ -9,11 +10,13 @@ from finetune_tw.train_predictor import (
     _build_ctx_for_date,
     _backup_predictor_checkpoint,
     _ensure_tokenizer_best_model,
+    _run_validation_metrics,
     _restore_predictor_training_state,
     _resolve_amp,
     _steps_for_epoch,
     _token_cache_paths,
 )
+from model.kronos import calc_time_stamps
 
 
 def test_config_accepts_training_control_fields():
@@ -150,6 +153,22 @@ def test_build_validation_contexts_uses_single_window_query(monkeypatch):
     assert calls[0][3] == max(val_dates).strftime("%Y-%m-%d")
     assert set(contexts) == set(pd.to_datetime(val_dates))
     assert [symbol for symbol, *_ in contexts[pd.Timestamp("2024-01-04")]] == ["AAA", "BBB"]
+    first_context = contexts[pd.Timestamp("2024-01-04")][0]
+    assert len(first_context) == 7
+    _, _, x_ts, y_ts, _, x_stamp, y_stamp = first_context
+    np.testing.assert_allclose(
+        x_stamp,
+        calc_time_stamps(x_ts).values.astype(np.float32),
+        rtol=0,
+        atol=0,
+    )
+    np.testing.assert_allclose(
+        y_stamp,
+        calc_time_stamps(y_ts).values.astype(np.float32),
+        rtol=0,
+        atol=0,
+    )
+    assert y_stamp is contexts[pd.Timestamp("2024-01-04")][1][6]
 
 
 def test_build_validation_contexts_returns_empty_lists_when_query_is_empty(monkeypatch):
@@ -265,6 +284,85 @@ def test_build_validation_contexts_skips_short_or_null_contexts(monkeypatch):
     contexts = _build_validation_contexts(cfg, val_universe, val_dates)
 
     assert [symbol for symbol, *_ in contexts[pd.Timestamp("2024-01-05")]] == ["AAA"]
+
+
+def test_training_validation_path_builds_contexts_once_and_reuses_rows(monkeypatch):
+    cfg = Config(pred_len=3, lookback_window=3)
+    val_dates = pd.to_datetime(["2024-01-03", "2024-01-04"])
+    contexts_by_date = {
+        pd.Timestamp("2024-01-03"): [("AAA", object(), object(), object(), pd.Timestamp("2024-01-02"))],
+        pd.Timestamp("2024-01-04"): [("BBB", object(), object(), object(), pd.Timestamp("2024-01-03"))],
+    }
+    rows_by_date = {
+        pd.Timestamp("2024-01-03"): [("AAA", np.array([1.0, 2.0, 3.0]), 1.0, pd.Timestamp("2024-01-02"))],
+        pd.Timestamp("2024-01-04"): [("BBB", np.array([1.5, 2.5, 3.5]), 1.5, pd.Timestamp("2024-01-03"))],
+    }
+    calls = {"build": [], "collect": [], "metrics": []}
+
+    def fake_build_validation_contexts(cfg_arg, val_universe_arg, val_dates_arg):
+        calls["build"].append((cfg_arg, list(val_universe_arg), list(val_dates_arg)))
+        return contexts_by_date
+
+    def fake_collect_validation_rows_by_date(
+        predict_batch_fn,
+        contexts_by_date_arg,
+        cfg_arg,
+        batch_size=64,
+        prepared_batch_predict_fn=None,
+    ):
+        calls["collect"].append(
+            (predict_batch_fn, contexts_by_date_arg, cfg_arg, batch_size, prepared_batch_predict_fn)
+        )
+        return rows_by_date
+
+    def fake_compute_validation_metrics_from_rows(
+        rows_by_date_arg,
+        actual_lookup_arg,
+        val_dates_arg,
+        cfg_arg,
+        target_horizon,
+        compute_ic=True,
+        compute_ic_ir=True,
+    ):
+        calls["metrics"].append(
+            (
+                rows_by_date_arg,
+                actual_lookup_arg,
+                list(val_dates_arg),
+                cfg_arg,
+                target_horizon,
+                compute_ic,
+                compute_ic_ir,
+            )
+        )
+        return 0.5, 0.4
+
+    monkeypatch.setattr(
+        "finetune_tw.train_predictor._build_validation_contexts",
+        fake_build_validation_contexts,
+    )
+    monkeypatch.setattr(
+        "finetune_tw.train_predictor.collect_validation_rows_by_date",
+        fake_collect_validation_rows_by_date,
+    )
+    monkeypatch.setattr(
+        "finetune_tw.train_predictor.compute_validation_metrics_from_rows",
+        fake_compute_validation_metrics_from_rows,
+    )
+
+    result = _run_validation_metrics(
+        cfg=cfg,
+        predict_batch_fn=object(),
+        prepared_batch_predict_fn=object(),
+        actual_lookup=lambda sym, last_date, n: np.array([1.0, 2.0, 3.0], dtype=float),
+        val_universe=["AAA", "BBB"],
+        val_dates=val_dates,
+    )
+
+    assert result == (0.5, 0.4)
+    assert len(calls["build"]) == 1
+    assert len(calls["collect"]) == 1
+    assert len(calls["metrics"]) == 1
 
 
 def test_token_cache_paths_are_split_specific(tmp_path):
