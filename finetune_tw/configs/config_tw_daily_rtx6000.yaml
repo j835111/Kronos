@@ -26,7 +26,7 @@ val_steps_per_epoch: 200
 amp_dtype: "bf16"
 enable_tf32: true
 token_cache_enabled: true
-token_cache_dtype: "uint16"
+token_cache_dtype: "int32"
 seed: 42
 
 early_stop_patience: 3
