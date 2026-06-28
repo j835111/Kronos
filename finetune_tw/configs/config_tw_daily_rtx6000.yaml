@@ -1,6 +1,6 @@
 # RTX Pro 6000 (96 GB VRAM) — validated conservative defaults for a 4-core MoLab host
 # Usage: python -m finetune_tw.train_tokenizer --config finetune_tw/configs/config_tw_daily_rtx6000.yaml
-db_path: "/mnt/first/kronos_state/data/tw_stocks.db"
+db_path: "/workspace/Kronos/finetune_tw/data/tw_stocks.db"
 lookback_window: 90
 predict_window: 10
 max_context: 512
@@ -10,7 +10,7 @@ val_end_date: "2024-06-30"
 
 tokenizer_epochs: 12
 basemodel_epochs: 20
-batch_size: 1024
+batch_size: 256
 save_steps: 500
 log_interval: 50
 tokenizer_lr: 0.0002
@@ -43,7 +43,7 @@ hf_revision_out: "round-3"
 hf_checkpoint_revision_out: "checkpoints-round-3"
 hf_checkpoint_keep_last_n: 3
 exp_name: "tw_daily"
-output_dir: "/mnt/first/kronos_state/outputs"
+output_dir: "/workspace/Kronos/finetune_tw/outputs"
 
 top_k: 10
 hold_days: 5
