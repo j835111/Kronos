@@ -7,6 +7,8 @@ import pytest
 from finetune_tw.ic_validation import (
     _collect_rows_for_date,
     EarlyStopper,
+    collect_validation_rows_by_date,
+    compute_validation_metrics_from_rows,
     mean_cross_sectional_ic,
     pick_val_dates,
     pick_val_universe,
@@ -151,6 +153,83 @@ def test_collect_rows_returns_open():
     np.testing.assert_allclose(pred_open, [11.0, 12.0, 13.0])
     assert pred_open_t1 == pytest.approx(11.0)
     assert last_date == pd.Timestamp("2024-01-02")
+
+
+def test_collect_rows_by_date_batches_once_per_date():
+    cfg = SimpleNamespace(pred_len=3, val_ic_horizons=2)
+    val_dates = pd.to_datetime(["2024-01-03", "2024-01-04"])
+    contexts_by_date = {
+        pd.Timestamp("2024-01-03"): [
+            ("AAA", *_make_ctx(last_date="2024-01-02", ctx_ref=10.0)),
+            ("BBB", *_make_ctx(last_date="2024-01-02", ctx_ref=11.0)),
+        ],
+        pd.Timestamp("2024-01-04"): [
+            ("CCC", *_make_ctx(last_date="2024-01-03", ctx_ref=12.0)),
+        ],
+    }
+    pred_df = pd.DataFrame({"open": [11.0, 12.0, 13.0], "close": [11.0, 12.0, 13.0]})
+    calls = []
+
+    def predict_batch_fn(df_list, x_timestamp_list, y_timestamp_list, pred_len):
+        calls.append((len(df_list), pred_len))
+        return [pred_df.copy() for _ in df_list]
+
+    rows_by_date = collect_validation_rows_by_date(
+        predict_batch_fn,
+        contexts_by_date,
+        cfg,
+    )
+
+    assert calls == [(2, cfg.pred_len), (1, cfg.pred_len)]
+    assert {pd.Timestamp(date): len(rows) for date, rows in rows_by_date.items()} == {
+        pd.Timestamp("2024-01-03"): 2,
+        pd.Timestamp("2024-01-04"): 1,
+    }
+
+
+def test_compute_validation_metrics_reuses_rows_for_both_outputs():
+    cfg = SimpleNamespace(pred_len=3, val_ic_horizons=2)
+    val_dates = pd.to_datetime(["2024-01-03", "2024-01-04", "2024-01-05"])
+    rows_by_date = {
+        pd.Timestamp("2024-01-03"): [
+            ("AAA", np.array([100.0, 101.0, 102.0]), 100.0, pd.Timestamp("2024-01-02")),
+            ("BBB", np.array([100.0, 102.0, 104.0]), 100.0, pd.Timestamp("2024-01-02")),
+            ("CCC", np.array([100.0, 103.0, 106.0]), 100.0, pd.Timestamp("2024-01-02")),
+        ],
+        pd.Timestamp("2024-01-04"): [
+            ("AAA", np.array([100.0, 102.0, 104.0]), 100.0, pd.Timestamp("2024-01-03")),
+            ("BBB", np.array([100.0, 103.0, 106.0]), 100.0, pd.Timestamp("2024-01-03")),
+            ("CCC", np.array([100.0, 104.0, 108.0]), 100.0, pd.Timestamp("2024-01-03")),
+        ],
+        pd.Timestamp("2024-01-05"): [
+            ("AAA", np.array([100.0, 103.0, 106.0]), 100.0, pd.Timestamp("2024-01-04")),
+            ("BBB", np.array([100.0, 104.0, 108.0]), 100.0, pd.Timestamp("2024-01-04")),
+            ("CCC", np.array([100.0, 105.0, 110.0]), 100.0, pd.Timestamp("2024-01-04")),
+        ],
+    }
+    calls = []
+
+    def actual_lookup(sym, last_date, n):
+        calls.append((sym, pd.Timestamp(last_date), n))
+        base = {"AAA": 100.0, "BBB": 101.0, "CCC": 102.0}[sym]
+        day_bump = {
+            pd.Timestamp("2024-01-02"): 0.0,
+            pd.Timestamp("2024-01-03"): 1.0,
+            pd.Timestamp("2024-01-04"): 2.0,
+        }[pd.Timestamp(last_date)]
+        return np.array([base, base + day_bump + 2.0, base + day_bump + 4.0], dtype=float)[:n]
+
+    val_ic, ic_ir = compute_validation_metrics_from_rows(
+        rows_by_date,
+        actual_lookup,
+        val_dates,
+        cfg,
+        target_horizon=1,
+    )
+
+    assert np.isfinite(val_ic)
+    assert np.isfinite(ic_ir)
+    assert len(calls) == len(val_dates) * 3 * 2
 
 
 def test_validate_ic_open_to_open():

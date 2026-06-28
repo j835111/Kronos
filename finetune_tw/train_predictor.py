@@ -22,10 +22,10 @@ from finetune_tw.dataset import MultiStockDataset
 from finetune_tw.db import list_symbols, query_symbol, query_symbols_window
 from finetune_tw.ic_validation import (
     EarlyStopper,
+    collect_validation_rows_by_date,
+    compute_validation_metrics_from_rows,
     pick_val_dates,
     pick_val_universe,
-    validate_predictor_ic,
-    validate_predictor_ic_ir,
 )
 from finetune_tw.hf_utils import (
     local_checkpoints,
@@ -468,13 +468,6 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
     val_universe = pick_val_universe(all_syms, cfg.ic_val_symbols, cfg.seed)
     val_dates = pick_val_dates(cfg.train_end_date, cfg.val_end_date, cfg.ic_val_dates)
     validation_contexts = _build_validation_contexts(cfg, val_universe, val_dates)
-    validation_context_lookup = {
-        date: {
-            sym: (ctx_df, x_ts, y_ts, last_date, float(ctx_df["open"].iloc[-1]))
-            for sym, ctx_df, x_ts, y_ts, last_date in rows
-        }
-        for date, rows in validation_contexts.items()
-    }
     buffer_start = (pd.Timestamp(cfg.train_end_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
     actual_open_cache = {}
     for sym in val_universe:
@@ -560,11 +553,14 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
         model.eval()
         predict_fn = _make_predict_batch_fn(predictor)
         actual_fn = lambda sym, last, n: _actual_open_lookup(cfg, actual_open_cache, sym, last, n)
-        ctx_fn = lambda sym, rebal_date: validation_context_lookup.get(pd.Timestamp(rebal_date), {}).get(sym)
-
-        val_ic = validate_predictor_ic(predict_fn, actual_fn, val_universe, val_dates, cfg, ctx_fn)
-        ic_ir_h5 = validate_predictor_ic_ir(predict_fn, actual_fn, val_universe, val_dates, cfg, ctx_fn,
-                                             target_horizon=min(5, cfg.pred_len))
+        rows_by_date = collect_validation_rows_by_date(predict_fn, validation_contexts, cfg)
+        val_ic, ic_ir_h5 = compute_validation_metrics_from_rows(
+            rows_by_date,
+            actual_fn,
+            val_dates,
+            cfg,
+            target_horizon=min(5, cfg.pred_len),
+        )
 
         ic_ir_str = f"{ic_ir_h5:.4f}" if not (ic_ir_h5 != ic_ir_h5) else "nan"
         print(f"  val_loss={val_loss:.4f}  val_ic={val_ic:.4f}  ic_ir_h5={ic_ir_str}")

@@ -81,31 +81,116 @@ class EarlyStopper:
 
 def _collect_rows_for_date(predict_batch_fn, val_universe, date, cfg, build_ctx_fn, batch_size=64):
     """Return list of (sym, pred_open_arr, pred_open_t1, last_date) for one val date."""
-    required_pred_len = min(getattr(cfg, "val_ic_horizons", cfg.pred_len), cfg.pred_len - 1) + 1
-    syms, dfs, x_timestamps, y_timestamps, last_dates = [], [], [], [], []
+    contexts = []
     for sym in val_universe:
         built = build_ctx_fn(sym, date)
         if built is None:
             continue
         ctx_df, x_ts, y_ts, last_date, _ctx_ref = built
-        syms.append(sym); dfs.append(ctx_df)
-        x_timestamps.append(x_ts); y_timestamps.append(y_ts)
-        last_dates.append(last_date)
+        contexts.append((sym, ctx_df, x_ts, y_ts, last_date))
+    return collect_validation_rows_by_date(
+        predict_batch_fn,
+        {pd.Timestamp(date): contexts},
+        cfg,
+        batch_size=batch_size,
+    ).get(pd.Timestamp(date), [])
 
-    rows = []
-    for start in range(0, len(syms), batch_size):
-        stop = start + batch_size
-        preds = predict_batch_fn(dfs[start:stop], x_timestamps[start:stop],
-                                 y_timestamps[start:stop], cfg.pred_len)
-        for offset, pred in enumerate(preds):
-            if pred is None:
-                continue
-            pred_open = pred["open"].values.astype(float)
-            if len(pred_open) < required_pred_len:
-                continue
-            i = start + offset
-            rows.append((syms[i], pred_open, float(pred["open"].iloc[0]), last_dates[i]))
-    return rows
+
+def collect_validation_rows_by_date(predict_batch_fn, contexts_by_date, cfg, batch_size=64):
+    """Collect predictor rows once per date from prepared validation contexts."""
+    required_pred_len = min(getattr(cfg, "val_ic_horizons", cfg.pred_len), cfg.pred_len - 1) + 1
+    rows_by_date = {}
+    for date, contexts in contexts_by_date.items():
+        normalized_date = pd.Timestamp(date)
+        if not contexts:
+            rows_by_date[normalized_date] = []
+            continue
+
+        syms, dfs, x_timestamps, y_timestamps, last_dates = [], [], [], [], []
+        for context in contexts:
+            sym, ctx_df, x_ts, y_ts, last_date = context[:5]
+            syms.append(sym)
+            dfs.append(ctx_df)
+            x_timestamps.append(x_ts)
+            y_timestamps.append(y_ts)
+            last_dates.append(last_date)
+
+        rows = []
+        for start in range(0, len(syms), batch_size):
+            stop = start + batch_size
+            preds = predict_batch_fn(
+                dfs[start:stop],
+                x_timestamps[start:stop],
+                y_timestamps[start:stop],
+                cfg.pred_len,
+            )
+            for offset, pred in enumerate(preds):
+                if pred is None:
+                    continue
+                pred_open = pred["open"].values.astype(float)
+                if len(pred_open) < required_pred_len:
+                    continue
+                i = start + offset
+                rows.append((syms[i], pred_open, float(pred["open"].iloc[0]), last_dates[i]))
+        rows_by_date[normalized_date] = rows
+    return rows_by_date
+
+
+def compute_validation_metrics_from_rows(
+    rows_by_date,
+    actual_lookup,
+    val_dates,
+    cfg,
+    target_horizon: int = 5,
+):
+    """Compute mean cross-sectional IC and target-horizon IC-IR from shared rows."""
+    horizons = min(cfg.val_ic_horizons, cfg.pred_len - 1)
+    per_group = {}
+    normalized_dates = [pd.Timestamp(date) for date in val_dates]
+    for date in normalized_dates:
+        rows = rows_by_date.get(date, [])
+        actual_by_row = []
+        for sym, pred_open, pred_open_t1, last_date in rows:
+            actual_open = np.asarray(actual_lookup(sym, last_date, cfg.pred_len), dtype=float)
+            actual_by_row.append((pred_open, pred_open_t1, actual_open))
+        for horizon in range(horizons):
+            pred_returns, actual_returns = [], []
+            for pred_open, pred_open_t1, actual_open in actual_by_row:
+                if len(actual_open) <= horizon + 1:
+                    continue
+                actual_open_t1 = actual_open[0]
+                if pred_open_t1 <= 0 or actual_open_t1 <= 0:
+                    continue
+                pred_returns.append(pred_open[horizon + 1] / pred_open_t1 - 1.0)
+                actual_returns.append(actual_open[horizon + 1] / actual_open_t1 - 1.0)
+            if len(pred_returns) >= 3:
+                per_group[(date, horizon + 1)] = (pred_returns, actual_returns)
+
+    max_horizon = min(target_horizon, cfg.pred_len - 1)
+    ic_ir = float("nan")
+    if max_horizon > 0:
+        horizon_idx = max_horizon - 1
+        per_date_ic: list[float] = []
+        for date in normalized_dates:
+            rows = rows_by_date.get(date, [])
+            pred_returns, actual_returns = [], []
+            for sym, pred_open, pred_open_t1, last_date in rows:
+                actual_open = np.asarray(actual_lookup(sym, last_date, cfg.pred_len), dtype=float)
+                if len(actual_open) <= horizon_idx + 1:
+                    continue
+                actual_open_t1 = actual_open[0]
+                if pred_open_t1 <= 0 or actual_open_t1 <= 0:
+                    continue
+                pred_returns.append(pred_open[horizon_idx + 1] / pred_open_t1 - 1.0)
+                actual_returns.append(actual_open[horizon_idx + 1] / actual_open_t1 - 1.0)
+            ic = rank_ic(pred_returns, actual_returns)
+            if np.isfinite(ic):
+                per_date_ic.append(ic)
+        if len(per_date_ic) >= 3:
+            arr = np.array(per_date_ic)
+            ic_ir = float(arr.mean() / (arr.std() + 1e-8))
+
+    return mean_cross_sectional_ic(per_group), ic_ir
 
 
 def validate_predictor_ic(
@@ -118,24 +203,25 @@ def validate_predictor_ic(
     batch_size=64,
 ) -> float:
     """Mean cross-sectional rank IC over open-to-open returns on a val subset."""
-    horizons = min(cfg.val_ic_horizons, cfg.pred_len - 1)
-    per_group = {}
-    for date in val_dates:
-        rows = _collect_rows_for_date(predict_batch_fn, val_universe, date, cfg, build_ctx_fn, batch_size)
-        for horizon in range(horizons):
-            pred_returns, actual_returns = [], []
-            for sym, pred_open, pred_open_t1, last_date in rows:
-                actual_open = np.asarray(actual_lookup(sym, last_date, cfg.pred_len), dtype=float)
-                if len(actual_open) <= horizon + 1:
-                    continue
-                actual_open_t1 = actual_open[0]
-                if pred_open_t1 <= 0 or actual_open_t1 <= 0:
-                    continue
-                pred_returns.append(pred_open[horizon + 1] / pred_open_t1 - 1.0)
-                actual_returns.append(actual_open[horizon + 1] / actual_open_t1 - 1.0)
-            if len(pred_returns) >= 3:
-                per_group[(pd.Timestamp(date), horizon + 1)] = (pred_returns, actual_returns)
-    return mean_cross_sectional_ic(per_group)
+    rows_by_date = {
+        pd.Timestamp(date): _collect_rows_for_date(
+            predict_batch_fn,
+            val_universe,
+            date,
+            cfg,
+            build_ctx_fn,
+            batch_size,
+        )
+        for date in val_dates
+    }
+    val_ic, _ = compute_validation_metrics_from_rows(
+        rows_by_date,
+        actual_lookup,
+        val_dates,
+        cfg,
+        target_horizon=min(cfg.pred_len - 1, getattr(cfg, "val_ic_horizons", cfg.pred_len)),
+    )
+    return val_ic
 
 
 def validate_predictor_ic_ir(
@@ -153,28 +239,22 @@ def validate_predictor_ic_ir(
     More noise-robust than IC mean: rewards consistent signal over single-day spikes.
     Returns nan if fewer than 3 finite IC values are available.
     """
-    max_horizon = min(target_horizon, cfg.pred_len - 1)
-    if max_horizon <= 0:
-        return float("nan")
-    h = max_horizon - 1  # 0-indexed
-    per_date_ic: list[float] = []
-    for date in val_dates:
-        rows = _collect_rows_for_date(predict_batch_fn, val_universe, date, cfg, build_ctx_fn, batch_size)
-        pred_returns, actual_returns = [], []
-        for sym, pred_open, pred_open_t1, last_date in rows:
-            actual_open = np.asarray(actual_lookup(sym, last_date, cfg.pred_len), dtype=float)
-            if len(actual_open) <= h + 1:
-                continue
-            actual_open_t1 = actual_open[0]
-            if pred_open_t1 <= 0 or actual_open_t1 <= 0:
-                continue
-            pred_returns.append(pred_open[h + 1] / pred_open_t1 - 1.0)
-            actual_returns.append(actual_open[h + 1] / actual_open_t1 - 1.0)
-        ic = rank_ic(pred_returns, actual_returns)
-        if np.isfinite(ic):
-            per_date_ic.append(ic)
-
-    if len(per_date_ic) < 3:
-        return float("nan")
-    arr = np.array(per_date_ic)
-    return float(arr.mean() / (arr.std() + 1e-8))
+    rows_by_date = {
+        pd.Timestamp(date): _collect_rows_for_date(
+            predict_batch_fn,
+            val_universe,
+            date,
+            cfg,
+            build_ctx_fn,
+            batch_size,
+        )
+        for date in val_dates
+    }
+    _, ic_ir = compute_validation_metrics_from_rows(
+        rows_by_date,
+        actual_lookup,
+        val_dates,
+        cfg,
+        target_horizon=target_horizon,
+    )
+    return ic_ir
