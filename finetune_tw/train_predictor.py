@@ -17,15 +17,16 @@ from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader, Dataset
 
 from model import Kronos, KronosTokenizer, KronosPredictor
+from model.kronos import calc_time_stamps
 from finetune_tw.config import Config
 from finetune_tw.dataset import MultiStockDataset
-from finetune_tw.db import list_symbols, query_symbol
+from finetune_tw.db import list_symbols, query_symbol, query_symbols_window
 from finetune_tw.ic_validation import (
     EarlyStopper,
+    collect_validation_rows_by_date,
+    compute_validation_metrics_from_rows,
     pick_val_dates,
     pick_val_universe,
-    validate_predictor_ic,
-    validate_predictor_ic_ir,
 )
 from finetune_tw.hf_utils import (
     local_checkpoints,
@@ -261,6 +262,55 @@ def _build_ctx_for_date(cfg, sym, rebal_date):
     return ctx_df, x_ts, y_ts, x_ts.iloc[-1], float(ctx_df["open"].iloc[-1])
 
 
+def _build_validation_contexts(cfg: Config, val_universe, val_dates) -> dict[pd.Timestamp, list[tuple]]:
+    if len(val_dates) == 0 or len(val_universe) == 0:
+        return {}
+
+    normalized_dates = [pd.Timestamp(date) for date in val_dates]
+    lookback_start = (
+        min(normalized_dates) - pd.Timedelta(days=cfg.lookback_window * 2)
+    ).strftime("%Y-%m-%d")
+    window_end = max(normalized_dates).strftime("%Y-%m-%d")
+    rows = query_symbols_window(
+        cfg.db_path,
+        list(val_universe),
+        start=lookback_start,
+        end=window_end,
+    )
+    if rows.empty:
+        return {date: [] for date in normalized_dates}
+
+    rows = rows.copy()
+    rows["date"] = pd.to_datetime(rows["date"])
+    contexts = {date: [] for date in normalized_dates}
+    y_ts_by_date = {
+        date: pd.Series(pd.date_range(date, periods=cfg.pred_len, freq="B"))
+        for date in normalized_dates
+    }
+    y_stamp_by_date = {
+        date: calc_time_stamps(y_ts).values.astype(np.float32)
+        for date, y_ts in y_ts_by_date.items()
+    }
+
+    for sym, sym_rows in rows.groupby("symbol", sort=False):
+        sym_rows = sym_rows.sort_values("date").reset_index(drop=True)
+        for date in normalized_dates:
+            eligible_rows = sym_rows[sym_rows["date"] <= date]
+            if len(eligible_rows) < cfg.lookback_window:
+                continue
+            ctx = eligible_rows.iloc[-cfg.lookback_window:]
+            ctx_df = ctx[["open", "high", "low", "close", "volume", "amount"]].reset_index(drop=True)
+            if ctx_df.isnull().any().any():
+                continue
+            x_ts = pd.to_datetime(ctx["date"]).reset_index(drop=True)
+            y_ts = y_ts_by_date[date]
+            x_stamp = calc_time_stamps(x_ts).values.astype(np.float32)
+            y_stamp = y_stamp_by_date[date]
+            contexts[date].append((sym, ctx_df, x_ts, y_ts.copy(), x_ts.iloc[-1], x_stamp, y_stamp))
+
+    return contexts
+
+
 def _actual_open_lookup(cfg, cache, sym, ctx_last_date, n):
     ser = cache.get(sym)
     if ser is None:
@@ -285,6 +335,67 @@ def _make_predict_batch_fn(predictor):
             )
 
     return fn
+
+
+def _make_predict_prepared_batch_fn(predictor):
+    def fn(df_list, x_timestamp_list, y_timestamp_list, pred_len, x_stamp_list, y_stamp_list):
+        with torch.no_grad():
+            prepared = predictor.prepare_batch_inputs(
+                df_list=df_list,
+                x_timestamp_list=x_timestamp_list,
+                y_timestamp_list=y_timestamp_list,
+                pred_len=pred_len,
+                x_stamp_list=x_stamp_list,
+                y_stamp_list=y_stamp_list,
+            )
+            return predictor.predict_prepared_batch(
+                *prepared,
+                pred_len=pred_len,
+                T=1.0,
+                top_k=1,
+                top_p=1.0,
+                sample_count=1,
+                verbose=False,
+            )
+
+    return fn
+
+
+def _maybe_make_predict_prepared_batch_fn(predictor):
+    if not (
+        hasattr(predictor, "prepare_batch_inputs")
+        and hasattr(predictor, "predict_prepared_batch")
+    ):
+        return None
+    return _make_predict_prepared_batch_fn(predictor)
+
+
+def _run_validation_metrics(
+    cfg,
+    predict_batch_fn,
+    actual_lookup,
+    val_universe,
+    val_dates,
+    batch_size=64,
+    prepared_batch_predict_fn=None,
+    contexts_by_date=None,
+):
+    if contexts_by_date is None:
+        contexts_by_date = _build_validation_contexts(cfg, val_universe, val_dates)
+    rows_by_date = collect_validation_rows_by_date(
+        predict_batch_fn,
+        contexts_by_date,
+        cfg,
+        batch_size=batch_size,
+        prepared_batch_predict_fn=prepared_batch_predict_fn,
+    )
+    return compute_validation_metrics_from_rows(
+        rows_by_date,
+        actual_lookup,
+        val_dates,
+        cfg,
+        target_horizon=min(5, cfg.pred_len),
+    )
 
 
 def _ensure_tokenizer_best_model(cfg: Config, exp_dir: Path) -> Path:
@@ -424,6 +535,7 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
     all_syms = [s for s in list_symbols(cfg.db_path) if s != cfg.benchmark_symbol]
     val_universe = pick_val_universe(all_syms, cfg.ic_val_symbols, cfg.seed)
     val_dates = pick_val_dates(cfg.train_end_date, cfg.val_end_date, cfg.ic_val_dates)
+    validation_contexts = _build_validation_contexts(cfg, val_universe, val_dates)
     buffer_start = (pd.Timestamp(cfg.train_end_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
     actual_open_cache = {}
     for sym in val_universe:
@@ -508,12 +620,17 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
         )
         model.eval()
         predict_fn = _make_predict_batch_fn(predictor)
+        prepared_predict_fn = _maybe_make_predict_prepared_batch_fn(predictor)
         actual_fn = lambda sym, last, n: _actual_open_lookup(cfg, actual_open_cache, sym, last, n)
-        ctx_fn = lambda sym, rebal_date: _build_ctx_for_date(cfg, sym, rebal_date)
-
-        val_ic = validate_predictor_ic(predict_fn, actual_fn, val_universe, val_dates, cfg, ctx_fn)
-        ic_ir_h5 = validate_predictor_ic_ir(predict_fn, actual_fn, val_universe, val_dates, cfg, ctx_fn,
-                                             target_horizon=min(5, cfg.pred_len))
+        val_ic, ic_ir_h5 = _run_validation_metrics(
+            cfg=cfg,
+            predict_batch_fn=predict_fn,
+            actual_lookup=actual_fn,
+            val_universe=val_universe,
+            val_dates=val_dates,
+            prepared_batch_predict_fn=prepared_predict_fn,
+            contexts_by_date=validation_contexts,
+        )
 
         ic_ir_str = f"{ic_ir_h5:.4f}" if not (ic_ir_h5 != ic_ir_h5) else "nan"
         print(f"  val_loss={val_loss:.4f}  val_ic={val_ic:.4f}  ic_ir_h5={ic_ir_str}")

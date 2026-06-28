@@ -1,18 +1,23 @@
 import torch
 import pandas as pd
+import numpy as np
 from pathlib import Path
 
 from finetune_tw.config import Config
 from finetune_tw.db import init_db, upsert_prices
 from finetune_tw.train_predictor import (
+    _build_validation_contexts,
     _build_ctx_for_date,
     _backup_predictor_checkpoint,
     _ensure_tokenizer_best_model,
+    _maybe_make_predict_prepared_batch_fn,
+    _run_validation_metrics,
     _restore_predictor_training_state,
     _resolve_amp,
     _steps_for_epoch,
     _token_cache_paths,
 )
+from model.kronos import calc_time_stamps
 
 
 def test_config_accepts_training_control_fields():
@@ -107,6 +112,345 @@ def test_build_ctx_for_date_insufficient_returns_none(tmp_path):
     cfg = Config(db_path=db, lookback_window=90, pred_len=10)
 
     assert _build_ctx_for_date(cfg, "9999", pd.Timestamp("2024-01-15")) is None
+
+
+def test_build_validation_contexts_uses_single_window_query(monkeypatch):
+    calls = []
+
+    def fake_query_symbols_window(db_path, symbols, start=None, end=None):
+        calls.append((db_path, symbols, start, end))
+        dates = pd.bdate_range("2024-01-01", periods=5)
+        rows = []
+        for symbol in ["AAA", "BBB"]:
+            for date in dates:
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "date": date.strftime("%Y-%m-%d"),
+                        "open": 1.0,
+                        "high": 2.0,
+                        "low": 0.5,
+                        "close": 1.5,
+                        "volume": 100.0,
+                        "amount": 1000.0,
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    monkeypatch.setattr("finetune_tw.train_predictor.query_symbols_window", fake_query_symbols_window)
+
+    cfg = Config(db_path="ignored", lookback_window=3, pred_len=2)
+    val_universe = ["AAA", "BBB"]
+    val_dates = pd.to_datetime(["2024-01-04", "2024-01-05"])
+
+    contexts = _build_validation_contexts(cfg, val_universe, val_dates)
+
+    assert len(calls) == 1
+    assert calls[0][0] == cfg.db_path
+    assert calls[0][1] == val_universe
+    assert calls[0][2] == (
+        min(val_dates) - pd.Timedelta(days=cfg.lookback_window * 2)
+    ).strftime("%Y-%m-%d")
+    assert calls[0][3] == max(val_dates).strftime("%Y-%m-%d")
+    assert set(contexts) == set(pd.to_datetime(val_dates))
+    assert [symbol for symbol, *_ in contexts[pd.Timestamp("2024-01-04")]] == ["AAA", "BBB"]
+    first_context = contexts[pd.Timestamp("2024-01-04")][0]
+    assert len(first_context) == 7
+    _, _, x_ts, y_ts, _, x_stamp, y_stamp = first_context
+    np.testing.assert_allclose(
+        x_stamp,
+        calc_time_stamps(x_ts).values.astype(np.float32),
+        rtol=0,
+        atol=0,
+    )
+    np.testing.assert_allclose(
+        y_stamp,
+        calc_time_stamps(y_ts).values.astype(np.float32),
+        rtol=0,
+        atol=0,
+    )
+    assert y_stamp is contexts[pd.Timestamp("2024-01-04")][1][6]
+
+
+def test_build_validation_contexts_returns_empty_lists_when_query_is_empty(monkeypatch):
+    def fake_query_symbols_window(db_path, symbols, start=None, end=None):
+        return pd.DataFrame(
+            columns=["symbol", "date", "open", "high", "low", "close", "volume", "amount"]
+        )
+
+    monkeypatch.setattr("finetune_tw.train_predictor.query_symbols_window", fake_query_symbols_window)
+
+    cfg = Config(db_path="ignored", lookback_window=3, pred_len=2)
+    val_universe = ["AAA", "BBB"]
+    val_dates = pd.to_datetime(["2024-01-04", "2024-01-05"])
+
+    contexts = _build_validation_contexts(cfg, val_universe, val_dates)
+
+    assert contexts == {pd.Timestamp(date): [] for date in val_dates}
+
+
+def test_build_validation_contexts_skips_short_or_null_contexts(monkeypatch):
+    def fake_query_symbols_window(db_path, symbols, start=None, end=None):
+        return pd.DataFrame(
+            [
+                {
+                    "symbol": "AAA",
+                    "date": "2024-01-03",
+                    "open": 1.0,
+                    "high": 2.0,
+                    "low": 0.5,
+                    "close": 1.5,
+                    "volume": 100.0,
+                    "amount": 1000.0,
+                },
+                {
+                    "symbol": "AAA",
+                    "date": "2024-01-04",
+                    "open": 1.1,
+                    "high": 2.1,
+                    "low": 0.6,
+                    "close": 1.6,
+                    "volume": 101.0,
+                    "amount": 1001.0,
+                },
+                {
+                    "symbol": "AAA",
+                    "date": "2024-01-05",
+                    "open": 1.2,
+                    "high": 2.2,
+                    "low": 0.7,
+                    "close": 1.7,
+                    "volume": 102.0,
+                    "amount": 1002.0,
+                },
+                {
+                    "symbol": "BBB",
+                    "date": "2024-01-04",
+                    "open": 3.0,
+                    "high": 4.0,
+                    "low": 2.5,
+                    "close": 3.5,
+                    "volume": 200.0,
+                    "amount": 2000.0,
+                },
+                {
+                    "symbol": "BBB",
+                    "date": "2024-01-05",
+                    "open": 3.1,
+                    "high": 4.1,
+                    "low": 2.6,
+                    "close": 3.6,
+                    "volume": 201.0,
+                    "amount": 2001.0,
+                },
+                {
+                    "symbol": "CCC",
+                    "date": "2024-01-03",
+                    "open": 5.0,
+                    "high": 6.0,
+                    "low": 4.5,
+                    "close": 5.5,
+                    "volume": 300.0,
+                    "amount": 3000.0,
+                },
+                {
+                    "symbol": "CCC",
+                    "date": "2024-01-04",
+                    "open": None,
+                    "high": 6.1,
+                    "low": 4.6,
+                    "close": 5.6,
+                    "volume": 301.0,
+                    "amount": 3001.0,
+                },
+                {
+                    "symbol": "CCC",
+                    "date": "2024-01-05",
+                    "open": 5.2,
+                    "high": 6.2,
+                    "low": 4.7,
+                    "close": 5.7,
+                    "volume": 302.0,
+                    "amount": 3002.0,
+                },
+            ]
+        )
+
+    monkeypatch.setattr("finetune_tw.train_predictor.query_symbols_window", fake_query_symbols_window)
+
+    cfg = Config(db_path="ignored", lookback_window=3, pred_len=2)
+    val_universe = ["AAA", "BBB", "CCC"]
+    val_dates = [pd.Timestamp("2024-01-05")]
+
+    contexts = _build_validation_contexts(cfg, val_universe, val_dates)
+
+    assert [symbol for symbol, *_ in contexts[pd.Timestamp("2024-01-05")]] == ["AAA"]
+
+
+def test_training_validation_path_builds_contexts_once_and_reuses_rows(monkeypatch):
+    cfg = Config(pred_len=3, lookback_window=3)
+    val_dates = pd.to_datetime(["2024-01-03", "2024-01-04"])
+    contexts_by_date = {
+        pd.Timestamp("2024-01-03"): [("AAA", object(), object(), object(), pd.Timestamp("2024-01-02"))],
+        pd.Timestamp("2024-01-04"): [("BBB", object(), object(), object(), pd.Timestamp("2024-01-03"))],
+    }
+    rows_by_date = {
+        pd.Timestamp("2024-01-03"): [("AAA", np.array([1.0, 2.0, 3.0]), 1.0, pd.Timestamp("2024-01-02"))],
+        pd.Timestamp("2024-01-04"): [("BBB", np.array([1.5, 2.5, 3.5]), 1.5, pd.Timestamp("2024-01-03"))],
+    }
+    calls = {"build": [], "collect": [], "metrics": []}
+
+    def fake_build_validation_contexts(cfg_arg, val_universe_arg, val_dates_arg):
+        calls["build"].append((cfg_arg, list(val_universe_arg), list(val_dates_arg)))
+        return contexts_by_date
+
+    def fake_collect_validation_rows_by_date(
+        predict_batch_fn,
+        contexts_by_date_arg,
+        cfg_arg,
+        batch_size=64,
+        prepared_batch_predict_fn=None,
+    ):
+        calls["collect"].append(
+            (predict_batch_fn, contexts_by_date_arg, cfg_arg, batch_size, prepared_batch_predict_fn)
+        )
+        return rows_by_date
+
+    def fake_compute_validation_metrics_from_rows(
+        rows_by_date_arg,
+        actual_lookup_arg,
+        val_dates_arg,
+        cfg_arg,
+        target_horizon,
+        compute_ic=True,
+        compute_ic_ir=True,
+    ):
+        calls["metrics"].append(
+            (
+                rows_by_date_arg,
+                actual_lookup_arg,
+                list(val_dates_arg),
+                cfg_arg,
+                target_horizon,
+                compute_ic,
+                compute_ic_ir,
+            )
+        )
+        return 0.5, 0.4
+
+    monkeypatch.setattr(
+        "finetune_tw.train_predictor._build_validation_contexts",
+        fake_build_validation_contexts,
+    )
+    monkeypatch.setattr(
+        "finetune_tw.train_predictor.collect_validation_rows_by_date",
+        fake_collect_validation_rows_by_date,
+    )
+    monkeypatch.setattr(
+        "finetune_tw.train_predictor.compute_validation_metrics_from_rows",
+        fake_compute_validation_metrics_from_rows,
+    )
+
+    result = _run_validation_metrics(
+        cfg=cfg,
+        predict_batch_fn=object(),
+        prepared_batch_predict_fn=object(),
+        actual_lookup=lambda sym, last_date, n: np.array([1.0, 2.0, 3.0], dtype=float),
+        val_universe=["AAA", "BBB"],
+        val_dates=val_dates,
+    )
+
+    assert result == (0.5, 0.4)
+    assert len(calls["build"]) == 1
+    assert len(calls["collect"]) == 1
+    assert len(calls["metrics"]) == 1
+
+
+def test_run_validation_metrics_uses_prebuilt_contexts_without_rebuilding(monkeypatch):
+    cfg = Config(pred_len=3, lookback_window=3)
+    val_dates = pd.to_datetime(["2024-01-03", "2024-01-04"])
+    contexts_by_date = {
+        pd.Timestamp("2024-01-03"): [("AAA", object(), object(), object(), pd.Timestamp("2024-01-02"))],
+        pd.Timestamp("2024-01-04"): [("BBB", object(), object(), object(), pd.Timestamp("2024-01-03"))],
+    }
+    rows_by_date = {
+        pd.Timestamp("2024-01-03"): [("AAA", np.array([1.0, 2.0, 3.0]), 1.0, pd.Timestamp("2024-01-02"))],
+        pd.Timestamp("2024-01-04"): [("BBB", np.array([1.5, 2.5, 3.5]), 1.5, pd.Timestamp("2024-01-03"))],
+    }
+    calls = {"collect": [], "metrics": []}
+
+    def fail_build_validation_contexts(*args, **kwargs):
+        raise AssertionError("_build_validation_contexts should not be called when contexts_by_date is provided")
+
+    def fake_collect_validation_rows_by_date(
+        predict_batch_fn,
+        contexts_by_date_arg,
+        cfg_arg,
+        batch_size=64,
+        prepared_batch_predict_fn=None,
+    ):
+        calls["collect"].append(
+            (predict_batch_fn, contexts_by_date_arg, cfg_arg, batch_size, prepared_batch_predict_fn)
+        )
+        return rows_by_date
+
+    def fake_compute_validation_metrics_from_rows(
+        rows_by_date_arg,
+        actual_lookup_arg,
+        val_dates_arg,
+        cfg_arg,
+        target_horizon,
+        compute_ic=True,
+        compute_ic_ir=True,
+    ):
+        calls["metrics"].append(
+            (
+                rows_by_date_arg,
+                actual_lookup_arg,
+                list(val_dates_arg),
+                cfg_arg,
+                target_horizon,
+                compute_ic,
+                compute_ic_ir,
+            )
+        )
+        return 0.6, 0.3
+
+    monkeypatch.setattr(
+        "finetune_tw.train_predictor._build_validation_contexts",
+        fail_build_validation_contexts,
+    )
+    monkeypatch.setattr(
+        "finetune_tw.train_predictor.collect_validation_rows_by_date",
+        fake_collect_validation_rows_by_date,
+    )
+    monkeypatch.setattr(
+        "finetune_tw.train_predictor.compute_validation_metrics_from_rows",
+        fake_compute_validation_metrics_from_rows,
+    )
+
+    result = _run_validation_metrics(
+        cfg=cfg,
+        predict_batch_fn=object(),
+        prepared_batch_predict_fn=None,
+        actual_lookup=lambda sym, last_date, n: np.array([1.0, 2.0, 3.0], dtype=float),
+        val_universe=["AAA", "BBB"],
+        val_dates=val_dates,
+        contexts_by_date=contexts_by_date,
+    )
+
+    assert result == (0.6, 0.3)
+    assert len(calls["collect"]) == 1
+    assert calls["collect"][0][1] is contexts_by_date
+    assert len(calls["metrics"]) == 1
+
+
+def test_maybe_make_predict_prepared_batch_fn_returns_none_for_legacy_predictor():
+    class LegacyPredictor:
+        def predict_batch(self, *args, **kwargs):
+            return []
+
+    assert _maybe_make_predict_prepared_batch_fn(LegacyPredictor()) is None
 
 
 def test_token_cache_paths_are_split_specific(tmp_path):

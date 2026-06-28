@@ -7,6 +7,8 @@ import pytest
 from finetune_tw.ic_validation import (
     _collect_rows_for_date,
     EarlyStopper,
+    collect_validation_rows_by_date,
+    compute_validation_metrics_from_rows,
     mean_cross_sectional_ic,
     pick_val_dates,
     pick_val_universe,
@@ -153,6 +155,191 @@ def test_collect_rows_returns_open():
     assert last_date == pd.Timestamp("2024-01-02")
 
 
+def test_collect_rows_by_date_batches_once_per_date():
+    cfg = SimpleNamespace(pred_len=3, val_ic_horizons=2)
+    val_dates = pd.to_datetime(["2024-01-03", "2024-01-04"])
+    ctx_df_a, x_ts_a, y_ts_a, last_date_a, _ = _make_ctx(last_date="2024-01-02", ctx_ref=10.0)
+    ctx_df_b, x_ts_b, y_ts_b, last_date_b, _ = _make_ctx(last_date="2024-01-02", ctx_ref=11.0)
+    ctx_df_c, x_ts_c, y_ts_c, last_date_c, _ = _make_ctx(last_date="2024-01-03", ctx_ref=12.0)
+    contexts_by_date = {
+        pd.Timestamp("2024-01-03"): [
+            ("AAA", ctx_df_a, x_ts_a, y_ts_a, last_date_a),
+            ("BBB", ctx_df_b, x_ts_b, y_ts_b, last_date_b),
+        ],
+        pd.Timestamp("2024-01-04"): [
+            ("CCC", ctx_df_c, x_ts_c, y_ts_c, last_date_c),
+        ],
+    }
+    pred_df = pd.DataFrame({"open": [11.0, 12.0, 13.0], "close": [11.0, 12.0, 13.0]})
+    calls = []
+
+    def predict_batch_fn(df_list, x_timestamp_list, y_timestamp_list, pred_len):
+        calls.append((len(df_list), pred_len))
+        return [pred_df.copy() for _ in df_list]
+
+    rows_by_date = collect_validation_rows_by_date(
+        predict_batch_fn,
+        contexts_by_date,
+        cfg,
+    )
+
+    assert calls == [(2, cfg.pred_len), (1, cfg.pred_len)]
+    assert {pd.Timestamp(date): len(rows) for date, rows in rows_by_date.items()} == {
+        pd.Timestamp("2024-01-03"): 2,
+        pd.Timestamp("2024-01-04"): 1,
+    }
+
+
+def test_collect_rows_by_date_uses_prepared_batch_callback_with_precomputed_stamps():
+    cfg = SimpleNamespace(pred_len=3, val_ic_horizons=2)
+    x_stamp = np.ones((2, 5), dtype=np.float32)
+    y_stamp = np.full((3, 5), 2.0, dtype=np.float32)
+    ctx_df_a, x_ts_a, y_ts_a, last_date_a, _ = _make_ctx(last_date="2024-01-02", ctx_ref=10.0)
+    ctx_df_b, x_ts_b, y_ts_b, last_date_b, _ = _make_ctx(last_date="2024-01-02", ctx_ref=11.0)
+    contexts_by_date = {
+        pd.Timestamp("2024-01-03"): [
+            ("AAA", ctx_df_a, x_ts_a, y_ts_a, last_date_a, x_stamp, y_stamp),
+            ("BBB", ctx_df_b, x_ts_b, y_ts_b, last_date_b, x_stamp * 3, y_stamp),
+        ],
+    }
+    pred_df = pd.DataFrame({"open": [11.0, 12.0, 13.0], "close": [11.0, 12.0, 13.0]})
+    legacy_calls = []
+    prepared_calls = []
+
+    def predict_batch_fn(df_list, x_timestamp_list, y_timestamp_list, pred_len):
+        legacy_calls.append((df_list, x_timestamp_list, y_timestamp_list, pred_len))
+        return [pred_df.copy() for _ in df_list]
+
+    def prepared_batch_predict_fn(
+        df_list,
+        x_timestamp_list,
+        y_timestamp_list,
+        pred_len,
+        x_stamp_list,
+        y_stamp_list,
+    ):
+        prepared_calls.append(
+            {
+                "batch_size": len(df_list),
+                "pred_len": pred_len,
+                "x_stamp_list": x_stamp_list,
+                "y_stamp_list": y_stamp_list,
+            }
+        )
+        return [pred_df.copy() for _ in df_list]
+
+    rows_by_date = collect_validation_rows_by_date(
+        predict_batch_fn,
+        contexts_by_date,
+        cfg,
+        prepared_batch_predict_fn=prepared_batch_predict_fn,
+    )
+
+    assert legacy_calls == []
+    assert len(prepared_calls) == 1
+    assert prepared_calls[0]["batch_size"] == 2
+    assert prepared_calls[0]["pred_len"] == cfg.pred_len
+    assert prepared_calls[0]["x_stamp_list"][0] is x_stamp
+    assert prepared_calls[0]["x_stamp_list"][1] is not x_stamp
+    assert prepared_calls[0]["y_stamp_list"][0] is y_stamp
+    assert prepared_calls[0]["y_stamp_list"][1] is y_stamp
+    assert len(rows_by_date[pd.Timestamp("2024-01-03")]) == 2
+
+
+def test_collect_rows_by_date_falls_back_to_legacy_predict_when_no_prepared_callback():
+    cfg = SimpleNamespace(pred_len=3, val_ic_horizons=2)
+    x_stamp = np.ones((2, 5), dtype=np.float32)
+    y_stamp = np.full((3, 5), 2.0, dtype=np.float32)
+    ctx_df_a, x_ts_a, y_ts_a, last_date_a, _ = _make_ctx(last_date="2024-01-02", ctx_ref=10.0)
+    contexts_by_date = {
+        pd.Timestamp("2024-01-03"): [
+            ("AAA", ctx_df_a, x_ts_a, y_ts_a, last_date_a, x_stamp, y_stamp),
+        ],
+    }
+    pred_df = pd.DataFrame({"open": [11.0, 12.0, 13.0], "close": [11.0, 12.0, 13.0]})
+    legacy_calls = []
+
+    def predict_batch_fn(df_list, x_timestamp_list, y_timestamp_list, pred_len):
+        legacy_calls.append((df_list, x_timestamp_list, y_timestamp_list, pred_len))
+        return [pred_df.copy() for _ in df_list]
+
+    rows_by_date = collect_validation_rows_by_date(
+        predict_batch_fn,
+        contexts_by_date,
+        cfg,
+        prepared_batch_predict_fn=None,
+    )
+
+    assert len(legacy_calls) == 1
+    assert legacy_calls[0][3] == cfg.pred_len
+    assert len(rows_by_date[pd.Timestamp("2024-01-03")]) == 1
+
+
+def test_collect_rows_by_date_rejects_unsupported_context_tuple_shape():
+    cfg = SimpleNamespace(pred_len=3, val_ic_horizons=2)
+    ctx_df, x_ts, y_ts, last_date, ctx_ref = _make_ctx(last_date="2024-01-02", ctx_ref=10.0)
+    bad_contexts_by_date = {
+        pd.Timestamp("2024-01-03"): [
+            ("AAA", ctx_df, x_ts, y_ts, last_date, ctx_ref),
+        ],
+    }
+
+    def predict_batch_fn(df_list, x_timestamp_list, y_timestamp_list, pred_len):
+        raise AssertionError("predict_batch_fn should not be called for unsupported context tuple shape")
+
+    with pytest.raises(ValueError, match="Expected validation context tuples with 5 or 7 fields"):
+        collect_validation_rows_by_date(
+            predict_batch_fn,
+            bad_contexts_by_date,
+            cfg,
+        )
+
+
+def test_compute_validation_metrics_reuses_rows_for_both_outputs():
+    cfg = SimpleNamespace(pred_len=3, val_ic_horizons=2)
+    val_dates = pd.to_datetime(["2024-01-03", "2024-01-04", "2024-01-05"])
+    rows_by_date = {
+        pd.Timestamp("2024-01-03"): [
+            ("AAA", np.array([100.0, 101.0, 102.0]), 100.0, pd.Timestamp("2024-01-02")),
+            ("BBB", np.array([100.0, 102.0, 104.0]), 100.0, pd.Timestamp("2024-01-02")),
+            ("CCC", np.array([100.0, 103.0, 106.0]), 100.0, pd.Timestamp("2024-01-02")),
+        ],
+        pd.Timestamp("2024-01-04"): [
+            ("AAA", np.array([100.0, 102.0, 104.0]), 100.0, pd.Timestamp("2024-01-03")),
+            ("BBB", np.array([100.0, 103.0, 106.0]), 100.0, pd.Timestamp("2024-01-03")),
+            ("CCC", np.array([100.0, 104.0, 108.0]), 100.0, pd.Timestamp("2024-01-03")),
+        ],
+        pd.Timestamp("2024-01-05"): [
+            ("AAA", np.array([100.0, 103.0, 106.0]), 100.0, pd.Timestamp("2024-01-04")),
+            ("BBB", np.array([100.0, 104.0, 108.0]), 100.0, pd.Timestamp("2024-01-04")),
+            ("CCC", np.array([100.0, 105.0, 110.0]), 100.0, pd.Timestamp("2024-01-04")),
+        ],
+    }
+    calls = []
+
+    def actual_lookup(sym, last_date, n):
+        calls.append((sym, pd.Timestamp(last_date), n))
+        base = {"AAA": 100.0, "BBB": 101.0, "CCC": 102.0}[sym]
+        day_bump = {
+            pd.Timestamp("2024-01-02"): 0.0,
+            pd.Timestamp("2024-01-03"): 1.0,
+            pd.Timestamp("2024-01-04"): 2.0,
+        }[pd.Timestamp(last_date)]
+        return np.array([base, base + day_bump + 2.0, base + day_bump + 4.0], dtype=float)[:n]
+
+    val_ic, ic_ir = compute_validation_metrics_from_rows(
+        rows_by_date,
+        actual_lookup,
+        val_dates,
+        cfg,
+        target_horizon=1,
+    )
+
+    assert np.isfinite(val_ic)
+    assert np.isfinite(ic_ir)
+    assert len(calls) == len(val_dates) * 3
+
+
 def test_validate_ic_open_to_open():
     cfg = _make_cfg(pred_len=3, val_ic_horizons=1)
     val_universe = ["AAA", "BBB", "CCC", "DDD", "EEE"]
@@ -237,3 +424,32 @@ def test_validate_ic_ir_open_to_open():
 
     assert np.isfinite(ic_ir)
     assert ic_ir > 1e7
+
+
+def test_validate_ic_ir_target_horizon_zero_short_circuits():
+    cfg = _make_cfg(pred_len=3, val_ic_horizons=2)
+    calls = {"predict": 0, "actual": 0}
+
+    def build_ctx_fn(sym, date):
+        raise AssertionError("build_ctx_fn should not be called when target_horizon <= 0")
+
+    def predict_batch_fn(df_list, x_timestamp_list, y_timestamp_list, pred_len):
+        calls["predict"] += 1
+        raise AssertionError("predict_batch_fn should not be called when target_horizon <= 0")
+
+    def actual_lookup(sym, last_date, n):
+        calls["actual"] += 1
+        raise AssertionError("actual_lookup should not be called when target_horizon <= 0")
+
+    ic_ir = validate_predictor_ic_ir(
+        predict_batch_fn,
+        actual_lookup,
+        ["AAA", "BBB", "CCC"],
+        pd.to_datetime(["2024-01-03", "2024-01-04"]),
+        cfg,
+        build_ctx_fn,
+        target_horizon=0,
+    )
+
+    assert np.isnan(ic_ir)
+    assert calls == {"predict": 0, "actual": 0}
