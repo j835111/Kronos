@@ -189,6 +189,29 @@ def test_prepare_batch_inputs_rejects_mismatched_precomputed_lengths():
         raise AssertionError("Expected ValueError for mismatched precomputed timestamp lengths")
 
 
+def test_prepare_batch_inputs_rejects_wrong_y_timestamp_length_with_precomputed_stamps():
+    predictor = _make_predictor_stub()
+    df_list = [_make_df(0.0)]
+    x_ts = pd.Series(pd.bdate_range("2024-01-01", periods=3))
+    y_ts = pd.Series(pd.bdate_range("2024-01-04", periods=3))
+    x_stamp = np.ones((3, 5), dtype=np.float32)
+    y_stamp = np.full((2, 5), 2.0, dtype=np.float32)
+
+    try:
+        predictor.prepare_batch_inputs(
+            df_list=df_list,
+            x_timestamp_list=[x_ts],
+            y_timestamp_list=[y_ts],
+            pred_len=2,
+            x_stamp_list=[x_stamp],
+            y_stamp_list=[y_stamp],
+        )
+    except ValueError as exc:
+        assert "pred_len=2" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for mismatched y_timestamp length on fast path")
+
+
 def test_predict_prepared_batch_validates_batch_sizes():
     predictor = _make_predictor_stub()
     x_batch = np.zeros((2, 3, 6), dtype=np.float32)

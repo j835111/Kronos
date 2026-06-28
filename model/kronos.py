@@ -609,6 +609,10 @@ class KronosPredictor:
             y_timestamp = y_timestamp_list[i]
 
             x = df[self.price_cols + [self.vol_col, self.amt_vol]].values.astype(np.float32)
+            if len(x_timestamp) != x.shape[0]:
+                raise ValueError(f"Inconsistent lengths at index {i}: x has {x.shape[0]} vs x_timestamp has {len(x_timestamp)}.")
+            if len(y_timestamp) != pred_len:
+                raise ValueError(f"y_timestamp length at index {i} should equal pred_len={pred_len}, got {len(y_timestamp)}.")
             if x_stamp_list is not None:
                 x_stamp = np.asarray(x_stamp_list[i], dtype=np.float32)
             else:
