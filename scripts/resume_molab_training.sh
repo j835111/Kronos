@@ -72,6 +72,7 @@ fi
 
 GIT_BIN="${KRONOS_GIT_BIN:-git}"
 LAUNCH_PYTHON="${KRONOS_LAUNCH_PYTHON:-python3}"
+LAUNCH_WAIT_SECONDS="${KRONOS_LAUNCH_WAIT_SECONDS:-2}"
 STATE_DIR="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$STATE_DIR")"
 CONFIG_PATH="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CONFIG_PATH")"
 CONFIG_DIR="$(dirname "$CONFIG_PATH")"
@@ -152,15 +153,44 @@ fi
 
 stop_pidfile() {
   local pidfile="$1"
+  local expected_substring="$2"
   if [[ ! -f "$pidfile" ]]; then
     return 0
   fi
 
   local pid
   pid="$(<"$pidfile")"
+  if [[ ! "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    echo "invalid pid in $pidfile: $pid" >&2
+    return 1
+  fi
   if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+    if [[ -r "/proc/$pid/cmdline" ]]; then
+      local cmdline
+      cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline")"
+      if [[ "$cmdline" != *"$expected_substring"* ]]; then
+        echo "refusing to stop unexpected process $pid from $pidfile" >&2
+        return 1
+      fi
+    else
+      echo "unable to verify process identity for $pid from $pidfile" >&2
+      return 1
+    fi
     kill "$pid" >/dev/null 2>&1 || true
-    wait "$pid" >/dev/null 2>&1 || true
+    for _ in $(seq 1 50); do
+      if ! kill -0 "$pid" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 0.1
+    done
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      kill -9 "$pid" >/dev/null 2>&1 || true
+      sleep 0.1
+      if kill -0 "$pid" >/dev/null 2>&1; then
+        echo "failed to stop existing process $pid from $pidfile" >&2
+        return 1
+      fi
+    fi
   fi
   rm -f "$pidfile"
 }
@@ -175,9 +205,9 @@ if ! "$GIT_BIN" -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; 
 fi
 
 if [[ -n "$BRANCH" ]]; then
-  "$GIT_BIN" -C "$REPO_DIR" fetch origin "$BRANCH" >/dev/null 2>&1 || true
-  "$GIT_BIN" -C "$REPO_DIR" checkout "$BRANCH" >/dev/null 2>&1 || true
-  "$GIT_BIN" -C "$REPO_DIR" reset --hard "origin/$BRANCH" >/dev/null 2>&1 || true
+  "$GIT_BIN" -C "$REPO_DIR" fetch origin "$BRANCH" >/dev/null 2>&1
+  "$GIT_BIN" -C "$REPO_DIR" checkout "$BRANCH" >/dev/null 2>&1
+  "$GIT_BIN" -C "$REPO_DIR" reset --hard "origin/$BRANCH" >/dev/null 2>&1
 fi
 
 TRAIN_LOG="$STATE_DIR/logs/${STAGE}_train_stdout.log"
@@ -187,39 +217,83 @@ MONITOR_PIDFILE="$STATE_DIR/run/${STAGE}_monitor.pid"
 STAGE_DIR="$OUTPUT_DIR/$EXP_NAME/$STAGE"
 MODULE_NAME="finetune_tw.train_${STAGE}"
 
-stop_pidfile "$TRAIN_PIDFILE"
-stop_pidfile "$MONITOR_PIDFILE"
+stop_pidfile "$TRAIN_PIDFILE" "$MODULE_NAME"
+stop_pidfile "$MONITOR_PIDFILE" "resume_molab_training.sh"
 
 (
   cd "$REPO_DIR"
   exec "$LAUNCH_PYTHON" -m "$MODULE_NAME" --config "$CONFIG_PATH"
 ) >>"$TRAIN_LOG" 2>&1 &
-echo "$!" > "$TRAIN_PIDFILE"
+TRAIN_PID="$!"
+echo "$TRAIN_PID" > "$TRAIN_PIDFILE"
+launch_checks="$(python3 - "$LAUNCH_WAIT_SECONDS" <<'PY'
+import math
+import sys
+seconds = float(sys.argv[1])
+print(max(1, math.ceil(seconds / 0.1)))
+PY
+)"
+for _ in $(seq 1 "$launch_checks"); do
+  if ! kill -0 "$TRAIN_PID" >/dev/null 2>&1; then
+    rm -f "$TRAIN_PIDFILE"
+    echo "training process failed to start" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+if ! kill -0 "$TRAIN_PID" >/dev/null 2>&1; then
+  rm -f "$TRAIN_PIDFILE"
+  echo "training process failed to start" >&2
+  exit 1
+fi
 
 if [[ "${KRONOS_SKIP_MONITOR:-0}" != "1" ]]; then
   (
+    oneshot_retries=0
+    max_oneshot_retries="${KRONOS_MONITOR_ONESHOT_RETRIES:-10}"
     while true; do
-      latest_ckpt="$(python3 - "$STAGE_DIR/checkpoints" <<'PY'
+      snapshot="$(python3 - "$STAGE_DIR/checkpoints" "$STAGE_DIR/train_log.csv" <<'PY'
 from pathlib import Path
+import re
 import sys
 
 ckpt_dir = Path(sys.argv[1])
-ckpts = sorted(ckpt_dir.glob("ckpt-*"))
-print(ckpts[-1].name if ckpts else "none")
-PY
-)"
-      last_csv_line="$(python3 - "$STAGE_DIR/train_log.csv" <<'PY'
-from pathlib import Path
-import sys
+log_path = Path(sys.argv[2])
 
-log_path = Path(sys.argv[1])
+checkpoints = []
+for path in ckpt_dir.glob("ckpt-*.pt"):
+    if not path.is_file():
+        continue
+    if not re.fullmatch(r"ckpt-[0-9]+\.pt", path.name):
+        continue
+    try:
+        step = int(path.stem.split("-", 1)[1])
+    except (IndexError, ValueError):
+        continue
+    checkpoints.append((step, path.name))
+checkpoints.sort()
+latest_ckpt = checkpoints[-1][1] if checkpoints else "none"
+
 if not log_path.exists():
-    print("none")
+    last_csv_line = "none"
 else:
     lines = [line.strip() for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    print(lines[-1] if lines else "none")
+    last_csv_line = lines[-1] if lines else "none"
+
+print(f"{latest_ckpt}\t{last_csv_line}")
 PY
 )"
+      latest_ckpt="${snapshot%%$'\t'*}"
+      last_csv_line="${snapshot#*$'\t'}"
+      if [[ "${KRONOS_MONITOR_ONESHOT:-0}" == "1" && "$latest_ckpt" == "none" && "$last_csv_line" == "none" ]]; then
+        oneshot_retries=$((oneshot_retries + 1))
+        if (( oneshot_retries >= max_oneshot_retries )); then
+          printf '%s checkpoint=%s csv=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$latest_ckpt" "$last_csv_line" >> "$MONITOR_LOG"
+          break
+        fi
+        sleep 0.3
+        continue
+      fi
       printf '%s checkpoint=%s csv=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$latest_ckpt" "$last_csv_line" >> "$MONITOR_LOG"
       if [[ "${KRONOS_MONITOR_ONESHOT:-0}" == "1" ]]; then
         break
