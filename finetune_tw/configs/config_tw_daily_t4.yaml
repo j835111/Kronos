@@ -24,6 +24,7 @@ seed: 42
 
 early_stop_patience: 3
 train_steps_per_epoch: 1000
+val_steps_per_epoch: 200
 ic_val_symbols: 500
 ic_val_dates: 40
 ranking_loss_alpha: 0.0
