@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 from model import Kronos, KronosTokenizer, KronosPredictor
 from finetune_tw.config import Config
 from finetune_tw.dataset import MultiStockDataset
-from finetune_tw.db import list_symbols, query_symbol
+from finetune_tw.db import list_symbols, query_symbol, query_symbols_window
 from finetune_tw.ic_validation import (
     EarlyStopper,
     pick_val_dates,
@@ -261,6 +261,49 @@ def _build_ctx_for_date(cfg, sym, rebal_date):
     return ctx_df, x_ts, y_ts, x_ts.iloc[-1], float(ctx_df["open"].iloc[-1])
 
 
+def _build_validation_contexts(cfg: Config, val_universe, val_dates) -> dict[pd.Timestamp, list[tuple]]:
+    if len(val_dates) == 0 or len(val_universe) == 0:
+        return {}
+
+    normalized_dates = [pd.Timestamp(date) for date in val_dates]
+    lookback_start = (
+        min(normalized_dates) - pd.Timedelta(days=cfg.lookback_window * 2)
+    ).strftime("%Y-%m-%d")
+    window_end = max(normalized_dates).strftime("%Y-%m-%d")
+    rows = query_symbols_window(
+        cfg.db_path,
+        list(val_universe),
+        start=lookback_start,
+        end=window_end,
+    )
+    if rows.empty:
+        return {date: [] for date in normalized_dates}
+
+    rows = rows.copy()
+    rows["date"] = pd.to_datetime(rows["date"])
+    contexts = {date: [] for date in normalized_dates}
+    y_ts_by_date = {
+        date: pd.Series(pd.date_range(date, periods=cfg.pred_len, freq="B"))
+        for date in normalized_dates
+    }
+
+    for sym, sym_rows in rows.groupby("symbol", sort=False):
+        sym_rows = sym_rows.sort_values("date").reset_index(drop=True)
+        for date in normalized_dates:
+            eligible_rows = sym_rows[sym_rows["date"] <= date]
+            if len(eligible_rows) < cfg.lookback_window:
+                continue
+            ctx = eligible_rows.iloc[-cfg.lookback_window:]
+            ctx_df = ctx[["open", "high", "low", "close", "volume", "amount"]].reset_index(drop=True)
+            if ctx_df.isnull().any().any():
+                continue
+            x_ts = pd.to_datetime(ctx["date"]).reset_index(drop=True)
+            y_ts = y_ts_by_date[date]
+            contexts[date].append((sym, ctx_df, x_ts, y_ts.copy(), x_ts.iloc[-1]))
+
+    return contexts
+
+
 def _actual_open_lookup(cfg, cache, sym, ctx_last_date, n):
     ser = cache.get(sym)
     if ser is None:
@@ -424,6 +467,14 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
     all_syms = [s for s in list_symbols(cfg.db_path) if s != cfg.benchmark_symbol]
     val_universe = pick_val_universe(all_syms, cfg.ic_val_symbols, cfg.seed)
     val_dates = pick_val_dates(cfg.train_end_date, cfg.val_end_date, cfg.ic_val_dates)
+    validation_contexts = _build_validation_contexts(cfg, val_universe, val_dates)
+    validation_context_lookup = {
+        date: {
+            sym: (ctx_df, x_ts, y_ts, last_date, float(ctx_df["open"].iloc[-1]))
+            for sym, ctx_df, x_ts, y_ts, last_date in rows
+        }
+        for date, rows in validation_contexts.items()
+    }
     buffer_start = (pd.Timestamp(cfg.train_end_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
     actual_open_cache = {}
     for sym in val_universe:
@@ -509,7 +560,7 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
         model.eval()
         predict_fn = _make_predict_batch_fn(predictor)
         actual_fn = lambda sym, last, n: _actual_open_lookup(cfg, actual_open_cache, sym, last, n)
-        ctx_fn = lambda sym, rebal_date: _build_ctx_for_date(cfg, sym, rebal_date)
+        ctx_fn = lambda sym, rebal_date: validation_context_lookup.get(pd.Timestamp(rebal_date), {}).get(sym)
 
         val_ic = validate_predictor_ic(predict_fn, actual_fn, val_universe, val_dates, cfg, ctx_fn)
         ic_ir_h5 = validate_predictor_ic_ir(predict_fn, actual_fn, val_universe, val_dates, cfg, ctx_fn,

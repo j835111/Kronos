@@ -5,6 +5,7 @@ from pathlib import Path
 from finetune_tw.config import Config
 from finetune_tw.db import init_db, upsert_prices
 from finetune_tw.train_predictor import (
+    _build_validation_contexts,
     _build_ctx_for_date,
     _backup_predictor_checkpoint,
     _ensure_tokenizer_best_model,
@@ -107,6 +108,140 @@ def test_build_ctx_for_date_insufficient_returns_none(tmp_path):
     cfg = Config(db_path=db, lookback_window=90, pred_len=10)
 
     assert _build_ctx_for_date(cfg, "9999", pd.Timestamp("2024-01-15")) is None
+
+
+def test_build_validation_contexts_uses_single_window_query(monkeypatch):
+    calls = []
+
+    def fake_query_symbols_window(db_path, symbols, start=None, end=None):
+        calls.append((db_path, symbols, start, end))
+        dates = pd.bdate_range("2024-01-01", periods=5)
+        rows = []
+        for symbol in ["AAA", "BBB"]:
+            for date in dates:
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "date": date.strftime("%Y-%m-%d"),
+                        "open": 1.0,
+                        "high": 2.0,
+                        "low": 0.5,
+                        "close": 1.5,
+                        "volume": 100.0,
+                        "amount": 1000.0,
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    monkeypatch.setattr("finetune_tw.train_predictor.query_symbols_window", fake_query_symbols_window)
+
+    cfg = Config(db_path="ignored", lookback_window=3, pred_len=2)
+    val_universe = ["AAA", "BBB"]
+    val_dates = pd.to_datetime(["2024-01-04", "2024-01-05"])
+
+    contexts = _build_validation_contexts(cfg, val_universe, val_dates)
+
+    assert len(calls) == 1
+    assert set(contexts) == set(pd.to_datetime(val_dates))
+    assert [symbol for symbol, *_ in contexts[pd.Timestamp("2024-01-04")]] == ["AAA", "BBB"]
+
+
+def test_build_validation_contexts_skips_short_or_null_contexts(monkeypatch):
+    def fake_query_symbols_window(db_path, symbols, start=None, end=None):
+        return pd.DataFrame(
+            [
+                {
+                    "symbol": "AAA",
+                    "date": "2024-01-03",
+                    "open": 1.0,
+                    "high": 2.0,
+                    "low": 0.5,
+                    "close": 1.5,
+                    "volume": 100.0,
+                    "amount": 1000.0,
+                },
+                {
+                    "symbol": "AAA",
+                    "date": "2024-01-04",
+                    "open": 1.1,
+                    "high": 2.1,
+                    "low": 0.6,
+                    "close": 1.6,
+                    "volume": 101.0,
+                    "amount": 1001.0,
+                },
+                {
+                    "symbol": "AAA",
+                    "date": "2024-01-05",
+                    "open": 1.2,
+                    "high": 2.2,
+                    "low": 0.7,
+                    "close": 1.7,
+                    "volume": 102.0,
+                    "amount": 1002.0,
+                },
+                {
+                    "symbol": "BBB",
+                    "date": "2024-01-04",
+                    "open": 3.0,
+                    "high": 4.0,
+                    "low": 2.5,
+                    "close": 3.5,
+                    "volume": 200.0,
+                    "amount": 2000.0,
+                },
+                {
+                    "symbol": "BBB",
+                    "date": "2024-01-05",
+                    "open": 3.1,
+                    "high": 4.1,
+                    "low": 2.6,
+                    "close": 3.6,
+                    "volume": 201.0,
+                    "amount": 2001.0,
+                },
+                {
+                    "symbol": "CCC",
+                    "date": "2024-01-03",
+                    "open": 5.0,
+                    "high": 6.0,
+                    "low": 4.5,
+                    "close": 5.5,
+                    "volume": 300.0,
+                    "amount": 3000.0,
+                },
+                {
+                    "symbol": "CCC",
+                    "date": "2024-01-04",
+                    "open": None,
+                    "high": 6.1,
+                    "low": 4.6,
+                    "close": 5.6,
+                    "volume": 301.0,
+                    "amount": 3001.0,
+                },
+                {
+                    "symbol": "CCC",
+                    "date": "2024-01-05",
+                    "open": 5.2,
+                    "high": 6.2,
+                    "low": 4.7,
+                    "close": 5.7,
+                    "volume": 302.0,
+                    "amount": 3002.0,
+                },
+            ]
+        )
+
+    monkeypatch.setattr("finetune_tw.train_predictor.query_symbols_window", fake_query_symbols_window)
+
+    cfg = Config(db_path="ignored", lookback_window=3, pred_len=2)
+    val_universe = ["AAA", "BBB", "CCC"]
+    val_dates = [pd.Timestamp("2024-01-05")]
+
+    contexts = _build_validation_contexts(cfg, val_universe, val_dates)
+
+    assert [symbol for symbol, *_ in contexts[pd.Timestamp("2024-01-05")]] == ["AAA"]
 
 
 def test_token_cache_paths_are_split_specific(tmp_path):
