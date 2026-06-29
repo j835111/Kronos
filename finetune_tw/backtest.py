@@ -214,6 +214,13 @@ def build_model_specs(cfg: Config) -> dict[str, ModelSpec]:
                      else f"hf://{hf_repo}@round-3/predictor/best_model",
             pred_kwargs={},
         ),
+        "round4": ModelSpec(
+            label="Round 4",
+            tok_src=tok_src_local or f"hf://{hf_repo}@round-0/tokenizer/best_model",
+            tok_kwargs={},
+            pred_src=f"hf://{hf_repo}@round-4/predictor/best_model",
+            pred_kwargs={},
+        ),
     }
 
 
@@ -483,7 +490,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="finetune_tw/configs/config_tw_daily.yaml")
     parser.add_argument("--model", required=True,
-                        choices=["pretrained", "round0", "round1", "round2"],
+                        choices=["pretrained", "round0", "round1", "round2", "round3", "round4"],
                         help="Which model weights to load")
     parser.add_argument("--hold_days_list", type=int, nargs="+", default=[5, 10, 15],
                         help="Hold period variants in days (default: 5 10 15)")

@@ -456,6 +456,7 @@ def run_backtest_next_open(
     model_key: str,
     hold_days_list: list[int],
     use_atr_weights: bool = False,
+    top_k_list: list[int] | None = None,
 ) -> Path:
     specs = build_model_specs(cfg)
     if model_key not in specs:
@@ -516,91 +517,146 @@ def run_backtest_next_open(
     del predictor
     torch.cuda.empty_cache()
 
-    hold_variants: dict[str, dict] = {}
-    for hd in hold_days_list:
-        variant_signal_dates, variant_execution_dates = variant_schedules[hd]
-        holdings = signals_to_holdings(
-            raw_preds,
-            variant_signal_dates,
-            hd,
-            cfg.top_k,
-            cfg.min_signal_threshold,
-        )
-        period_weights: dict[str, dict[str, float]] | None = None
-        if use_atr_weights:
-            period_weights = {}
-            atr_samples: list[float] = []
-            for signal_date, execution_date, selected_syms in zip(
-                variant_signal_dates,
-                variant_execution_dates,
-                holdings,
-            ):
-                selected_list = sorted(selected_syms)
-                date_preds = raw_preds.get(signal_date.strftime("%Y-%m-%d"), {})
-                period_weights[execution_date.strftime("%Y-%m-%d")] = compute_atr_weights(
-                    date_preds,
-                    hd,
-                    selected_list,
-                )
-                for sym in selected_list:
-                    pred_atr = _predicted_atr_from_series(date_preds.get(sym), hd, 0.003)
-                    if pred_atr is not None:
-                        atr_samples.append(pred_atr)
-            if atr_samples:
-                print(
-                    f"  hold={hd}d ATR stats — min:{min(atr_samples):.4f}  "
-                    f"mean:{float(np.mean(atr_samples)):.4f}  max:{max(atr_samples):.4f}"
-                )
-                sys.stdout.flush()
-        build_kwargs = {
-            "price_frames": price_frames,
-            "holdings_sequence": holdings,
-            "execution_dates": variant_execution_dates,
-            "trading_dates": trading_dates,
-        }
-        if period_weights is not None:
-            build_kwargs["weights"] = period_weights
-        _, daily_returns = build_next_open_portfolio_returns(**build_kwargs)
-        if daily_returns.empty:
-            raise ValueError(
-                f"No realized daily returns for hold_days={hd}. "
-                "Check trading calendar coverage and execution dates."
-            )
-        metrics = compute_metrics(daily_returns)
-        hold_variants[str(hd)] = {
-            "dates": [d.strftime("%Y-%m-%d") for d in daily_returns.index],
-            "daily_returns": daily_returns.tolist(),
-            "metrics": metrics,
-        }
-        print(
-            f"  hold={hd}d — Ann:{metrics['annualised_return']:.2%}  "
-            f"Sharpe:{metrics['sharpe']:.2f}  DD:{metrics['max_drawdown']:.2%}"
-        )
-        sys.stdout.flush()
+    # Determine which top_k values to sweep
+    sweep_top_k = top_k_list if top_k_list else [cfg.top_k]
+    is_grid_search = top_k_list is not None and len(top_k_list) > 1
 
-    out = {
+    out_dir = Path(cfg.output_dir) / cfg.exp_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Grid search results: grid[tk][hd] = metrics dict
+    grid: dict[int, dict[int, dict]] = {}
+
+    for tk in sweep_top_k:
+        hold_variants: dict[str, dict] = {}
+        for hd in hold_days_list:
+            variant_signal_dates, variant_execution_dates = variant_schedules[hd]
+            holdings = signals_to_holdings(
+                raw_preds,
+                variant_signal_dates,
+                hd,
+                tk,
+                cfg.min_signal_threshold,
+            )
+            period_weights: dict[str, dict[str, float]] | None = None
+            if use_atr_weights:
+                period_weights = {}
+                atr_samples: list[float] = []
+                for signal_date, execution_date, selected_syms in zip(
+                    variant_signal_dates,
+                    variant_execution_dates,
+                    holdings,
+                ):
+                    selected_list = sorted(selected_syms)
+                    date_preds = raw_preds.get(signal_date.strftime("%Y-%m-%d"), {})
+                    period_weights[execution_date.strftime("%Y-%m-%d")] = compute_atr_weights(
+                        date_preds,
+                        hd,
+                        selected_list,
+                    )
+                    for sym in selected_list:
+                        pred_atr = _predicted_atr_from_series(date_preds.get(sym), hd, 0.003)
+                        if pred_atr is not None:
+                            atr_samples.append(pred_atr)
+                if atr_samples:
+                    print(
+                        f"  top_k={tk} hold={hd}d ATR stats — min:{min(atr_samples):.4f}  "
+                        f"mean:{float(np.mean(atr_samples)):.4f}  max:{max(atr_samples):.4f}"
+                    )
+                    sys.stdout.flush()
+            build_kwargs = {
+                "price_frames": price_frames,
+                "holdings_sequence": holdings,
+                "execution_dates": variant_execution_dates,
+                "trading_dates": trading_dates,
+            }
+            if period_weights is not None:
+                build_kwargs["weights"] = period_weights
+            _, daily_returns = build_next_open_portfolio_returns(**build_kwargs)
+            if daily_returns.empty:
+                raise ValueError(
+                    f"No realized daily returns for top_k={tk} hold_days={hd}. "
+                    "Check trading calendar coverage and execution dates."
+                )
+            metrics = compute_metrics(daily_returns)
+            hold_variants[str(hd)] = {
+                "dates": [d.strftime("%Y-%m-%d") for d in daily_returns.index],
+                "daily_returns": daily_returns.tolist(),
+                "metrics": metrics,
+            }
+            print(
+                f"  top_k={tk:>3} hold={hd}d — "
+                f"Ann:{metrics['annualised_return']:.2%}  "
+                f"Sharpe:{metrics['sharpe']:.2f}  DD:{metrics['max_drawdown']:.2%}"
+            )
+            sys.stdout.flush()
+        grid[tk] = {int(hd): hold_variants[str(hd)]["metrics"] for hd in hold_days_list}
+
+        if not is_grid_search:
+            # Single top_k: save full backtest JSON + plot (original behavior)
+            bm_metrics = compute_metrics(bm_daily)
+            out = {
+                "model_key": model_key,
+                "model_label": spec.label,
+                "test_start": cfg.test_start_date,
+                "test_end": test_end,
+                "top_k": tk,
+                "hold_variants": hold_variants,
+                "benchmark": {
+                    "dates": [d.strftime("%Y-%m-%d") for d in bm_daily.index],
+                    "daily_returns": bm_daily.tolist(),
+                    "metrics": bm_metrics,
+                },
+            }
+            out_path = out_dir / f"backtest_returns_{model_key}_next_open.json"
+            out_path.write_text(json.dumps(out, indent=2))
+            print(f"\nSaved → {out_path}")
+            sys.stdout.flush()
+            plot_backtest_next_open_results(out, out_dir)
+            return out_path
+
+    # Grid search: print summary table and save grid JSON
+    bm_metrics = compute_metrics(bm_daily)
+    print(f"\n{'=' * 70}")
+    print(f"Grid Search Summary — open/open v2  ({cfg.test_start_date} → {test_end})")
+    print(f"Benchmark ^TWII: Sharpe {bm_metrics['sharpe']:.2f}  "
+          f"Ann {bm_metrics['annualised_return']:.2%}  DD {bm_metrics['max_drawdown']:.2%}")
+    print(f"{'=' * 70}")
+    hold_cols = hold_days_list
+    header = f"{'top_k':>6}" + "".join(
+        f"  {'hold='+str(h)+'d':^26}" for h in hold_cols
+    )
+    subhdr = " " * 6 + "".join(
+        f"  {'Sharpe':>7}  {'Ann':>7}  {'MaxDD':>7}" for _ in hold_cols
+    )
+    print(header)
+    print(subhdr)
+    for tk in sweep_top_k:
+        row = f"{tk:>6}"
+        for hd in hold_cols:
+            m = grid[tk][hd]
+            row += f"  {m['sharpe']:>7.3f}  {m['annualised_return']:>6.1%}  {m['max_drawdown']:>6.1%}"
+        print(row)
+    sys.stdout.flush()
+
+    grid_out = {
         "model_key": model_key,
         "model_label": spec.label,
         "test_start": cfg.test_start_date,
         "test_end": test_end,
-        "top_k": cfg.top_k,
-        "hold_variants": hold_variants,
-        "benchmark": {
-            "dates": [d.strftime("%Y-%m-%d") for d in bm_daily.index],
-            "daily_returns": bm_daily.tolist(),
-            "metrics": compute_metrics(bm_daily),
+        "top_k_list": sweep_top_k,
+        "hold_days_list": hold_days_list,
+        "benchmark": bm_metrics,
+        "grid": {
+            str(tk): {str(hd): grid[tk][hd] for hd in hold_days_list}
+            for tk in sweep_top_k
         },
     }
-
-    out_dir = Path(cfg.output_dir) / cfg.exp_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"backtest_returns_{model_key}_next_open.json"
-    out_path.write_text(json.dumps(out, indent=2))
-    print(f"\nSaved → {out_path}")
+    grid_path = out_dir / f"grid_search_{model_key}_next_open.json"
+    grid_path.write_text(json.dumps(grid_out, indent=2))
+    print(f"\nSaved → {grid_path}")
     sys.stdout.flush()
-
-    plot_backtest_next_open_results(out, out_dir)
-    return out_path
+    return grid_path
 
 
 def main() -> None:
@@ -609,7 +665,7 @@ def main() -> None:
     parser.add_argument(
         "--model",
         required=True,
-        choices=["pretrained", "round0", "round1", "round2", "round3"],
+        choices=["pretrained", "round0", "round1", "round2", "round3", "round4"],
         help="Which model weights to load",
     )
     parser.add_argument(
@@ -620,6 +676,13 @@ def main() -> None:
         help="Hold period variants in days (default: 5 10 15)",
     )
     parser.add_argument("--top_k", type=int, default=None)
+    parser.add_argument(
+        "--top_k_list",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Grid-search over multiple top_k values (inference runs once)",
+    )
     parser.add_argument("--test_start", default=None)
     parser.add_argument(
         "--threshold",
@@ -647,6 +710,7 @@ def main() -> None:
         args.model,
         args.hold_days_list,
         use_atr_weights=args.atr_weights,
+        top_k_list=args.top_k_list,
     )
 
 
