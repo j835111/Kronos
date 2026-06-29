@@ -379,6 +379,7 @@ def _run_validation_metrics(
     batch_size=64,
     prepared_batch_predict_fn=None,
     contexts_by_date=None,
+    target_horizon=None,
 ):
     if contexts_by_date is None:
         contexts_by_date = _build_validation_contexts(cfg, val_universe, val_dates)
@@ -389,12 +390,14 @@ def _run_validation_metrics(
         batch_size=batch_size,
         prepared_batch_predict_fn=prepared_batch_predict_fn,
     )
+    if target_horizon is None:
+        target_horizon = min(5, cfg.pred_len)
     return compute_validation_metrics_from_rows(
         rows_by_date,
         actual_lookup,
         val_dates,
         cfg,
-        target_horizon=min(5, cfg.pred_len),
+        target_horizon=target_horizon,
     )
 
 
