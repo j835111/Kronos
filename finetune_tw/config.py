@@ -50,8 +50,9 @@ class Config:
 
     # HF Hub versioning (optional)
     hf_repo: str = ""           # e.g. "j835111/kronos-tw-finetune"
-    hf_revision: str = ""       # revision to load pretrained_predictor from HF
-    hf_revision_out: str = ""   # revision to push best_model to HF after training
+    hf_revision: str = ""           # revision to load pretrained_predictor from HF
+    hf_tokenizer_revision: str = "" # revision to load tokenizer from HF (defaults to hf_revision)
+    hf_revision_out: str = ""       # revision to push best_model to HF after training
     hf_checkpoint_revision_out: str = ""
     hf_checkpoint_keep_last_n: int = 3
 

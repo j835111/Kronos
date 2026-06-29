@@ -404,7 +404,7 @@ def _ensure_tokenizer_best_model(cfg: Config, exp_dir: Path) -> Path:
         return tok_path
     # hf_tokenizer_revision lets tokenizer and predictor come from different HF revisions.
     # Falls back to hf_revision_out for backward compatibility.
-    tok_revision = getattr(cfg, "hf_tokenizer_revision", None) or cfg.hf_revision_out
+    tok_revision = cfg.hf_tokenizer_revision or cfg.hf_revision or cfg.hf_revision_out
     if cfg.hf_repo and tok_revision:
         restore_best_model(
             exp_dir,
