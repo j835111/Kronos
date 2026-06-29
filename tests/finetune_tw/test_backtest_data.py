@@ -135,11 +135,11 @@ def test_build_rebalance_inputs_uses_preloaded_history_and_skips_invalid_symbols
         "volume",
         "amount",
     ]
-    assert list(batch_dfs[0]["open"]) == [12.0, 13.0, 14.0]
+    assert list(batch_dfs[0]["open"]) == [13.0, 14.0, 15.0]
     assert list(batch_xts[0].dt.strftime("%Y-%m-%d")) == [
-        "2024-01-03",
         "2024-01-04",
         "2024-01-05",
+        "2024-01-08",
     ]
     assert list(batch_yts[0].dt.strftime("%Y-%m-%d")) == [
         "2024-01-08",

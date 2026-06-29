@@ -66,7 +66,7 @@ def build_rebalance_inputs(
         if frame is None or frame.empty:
             continue
 
-        history = frame.loc[frame.index < rebal_date, _OHLCVA_COLUMNS]
+        history = frame.loc[frame.index <= rebal_date, _OHLCVA_COLUMNS]
         if len(history) < lookback_window:
             continue
 
