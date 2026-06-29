@@ -715,6 +715,6 @@ def test_run_backtest_next_open_raises_when_variant_has_no_realized_daily_return
 
     with pytest.raises(
         ValueError,
-        match=r"No realized daily returns for hold_days=2",
+        match=r"No realized daily returns for top_k=1 hold_days=2",
     ):
         bo.run_backtest_next_open(cfg, "round0", [2])
