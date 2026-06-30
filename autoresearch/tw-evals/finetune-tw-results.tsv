@@ -1,0 +1,16 @@
+# metric_direction: higher_is_better
+timestamp	iteration	metric	delta	ann	maxdd	status	technique	hypothesis	notes
+2026-06-20	round-0	1.356	0.000	50.0	35.0	baseline	retrain	Kronos-base TWSE fine-tune 可產生可執行 alpha	open/open v2，top_k=10，hold=5d；目標 Sharpe≥1.5，Ann>15%，MaxDD<20%
+2026-06-21	round-1	0.150	-1.206	-0.1	35.0	discard	retrain	IC early stopping 可改善泛化能力	從 pretrained 起點（起點錯誤）；IC 全程為負；val_loss 3.141 < Round 0 3.644 但回測反更差
+2026-06-22	grid-search-1	N/A	N/A	N/A	N/A	keep	strategy	策略參數優化無需重訓	close/close Sharpe 1.92（top_k=10,hold=3d），但不可執行；open/open hold=5d 約 1.356 不變；洞見：策略參數影響>>重訓
+2026-06-22	round-2	1.140	-0.216	38.0	36.0	discard	retrain	IC-IR@h5 early stop + 300×20 驗證集可超越 Round 0	從 Round 0 起點；best epoch=4，ic_ir_h5=0.4066；val_loss 全程退化（fine-tune→fine-tune 邊際遞減）
+2026-06-23	grid-search-2	N/A	N/A	N/A	N/A	keep	strategy	1090 symbols 提升信號區分度	close/close Sharpe 1.92（top_k=10,hold=3d），1090 vs 274 symbols；hold=3d 在 next_open 下無效（Sharpe 0.05）；確認最佳可執行為 hold=5d
+2026-06-24	stacking-mc5	N/A	N/A	N/A	N/A	discard	ensemble	MC 不確定性特徵可提升排名信號	close/close；stacker 1.70 < kronos_only 1.90；MC dispersion/q10/q90 是噪音
+2026-06-25	stacking-mc10	N/A	N/A	N/A	N/A	discard	ensemble	mc=10 確認 stacking 無益	close/close；kronos_only 1.835，stacker 1.057（輸 benchmark 1.600），stacking MaxDD 40.2%；MC 以任何形式使用皆有害
+2026-06-26	atr-sizing	1.356	0.000	50.0	35.0	no-op	strategy	pred_ATR 作 position sizing 可降低波動	1/pred_ATR 等比 sizing；Sharpe/MaxDD 無改善；維持等權重
+2026-06-26	volume-filter	1.356	0.000	50.0	35.0	no-op	strategy	排除底 25% volume 低流動性股票可提升 IC	Volume 信心過濾；無改善；功能已移除（commit ba13774）
+2026-06-28	round-3	0.500	-0.856	20.0	41.0	discard	retrain	open-to-open IC early stop 對齊部署目標可突破 Round 0	500×40 驗證集；IC-IR best 僅 0.0227（遠低於 Round 2 的 0.4066）；val_loss 全程上升（3.32→3.48）；open IC SNR 更低
+2026-06-29	grid-search-open	N/A	N/A	N/A	N/A	discard	strategy	open/open signal grid search 可找出超越 1.356 的策略參數	1090 symbols，test 2024-07-01→2026-06-29；最高 Sharpe 1.263（top_k=30,hold=7d）；無任何組合超越 Round 0；benchmark ^TWII 1.47 仍贏所有組合；MaxDD 全部 35%+
+2026-06-29	eval-forecast	N/A	N/A	N/A	N/A	discard	analysis	更換 hold_days 可找到隱藏的更強 horizon	IC-IR 從 h=1(0.64) 單調衰減至 h=10(0.26)；h=4 有小反彈無統計顯著；無隱藏強 horizon；換持倉期無效
+2026-06-29	round-4	1.240	-0.116	45.94	33.99	discard	retrain	FPT freeze + IC-IR@h1 early stop + extended warmup 可突破 Round 0 局部最優	從 Round 0 起點；凍結 self_attn+FFN（~5% trainable）；warmup_pct=0.08；best epoch=1（ic_ir_h1=0.3246），early stop epoch 7；open/open Sharpe 1.24 vs 1.356；Round 0 是 fine-tune 路徑局部最優，FPT 無效
+2026-06-30	round-0-rebase	1.120	-0.236	38.59	35.03	baseline	analysis	以最新 DB 重跑 Round 0 作為更新基準值	test 2024-07-01→2026-06-29（DB 截至 2026-06-26）；open/open hold=5d Sharpe 1.12（舊 1.356）；close hold=5d Sharpe 1.27；Sharpe 下降因測試期延長至 2026 含較弱行情；新基準供後續輪比較

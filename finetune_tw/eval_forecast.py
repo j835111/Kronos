@@ -90,16 +90,19 @@ def run_eval(cfg, smoke: bool = False, fidelity_symbols: int = 12,
         pred_src, pred_kw = cfg.pretrained_predictor, {}
         tag = "baseline"
     else:
+        from finetune_tw.backtest import _hf_local
         exp_dir   = Path(cfg.output_dir) / cfg.exp_name
-        tok_src,  tok_kw  = resolve_src(exp_dir / "tokenizer" / "best_model",
-                                        cfg.hf_repo, "tokenizer/best_model", cfg.hf_revision)
-        pred_src, pred_kw = resolve_src(exp_dir / "predictor" / "best_model",
-                                        cfg.hf_repo, "predictor/best_model", cfg.hf_revision)
+        local_tok  = exp_dir / "tokenizer" / "best_model"
+        local_pred = exp_dir / "predictor" / "best_model"
+        tok_src  = str(local_tok)  if (local_tok / "model.safetensors").exists() else \
+                   _hf_local(cfg.hf_repo, "tokenizer/best_model", cfg.hf_revision)
+        pred_src = str(local_pred) if (local_pred / "model.safetensors").exists() else \
+                   _hf_local(cfg.hf_repo, "predictor/best_model", cfg.hf_revision)
         tag = "finetuned"
     print(f"loading {tag}: tokenizer={tok_src} predictor={pred_src}", flush=True)
 
-    tokenizer = KronosTokenizer.from_pretrained(tok_src, **tok_kw).to(device)
-    model = Kronos.from_pretrained(pred_src, **pred_kw).to(device)
+    tokenizer = KronosTokenizer.from_pretrained(tok_src).to(device)
+    model = Kronos.from_pretrained(pred_src).to(device)
     predictor = KronosPredictor(model, tokenizer, device=device, max_context=cfg.max_context)
     tokenizer.eval(); model.eval()
 

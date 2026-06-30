@@ -21,6 +21,15 @@
 | close/close（grid search，top_k=10） | 1.92 | 86% | 26% |
 | **open/open v2（可執行，top_k=10，hold=5d）** | **1.356** | **50%** | **35%** |
 
+> **⟳ 重跑基準（2026-06-30，test 2024-07-01→2026-06-29，DB 截至 2026-06-26）**
+>
+> | 評估方式 | Sharpe | Ann | MaxDD |
+> |----------|--------|-----|-------|
+> | close/close（top_k=10，hold=5d） | **1.27** | 50.41% | 31.46% |
+> | **open/open v2（top_k=10，hold=5d）** | **1.12** | 38.59% | 35.03% |
+>
+> open/open Sharpe 從 1.356 → 1.12 的原因：測試期延長至 2026 年含較弱市場行情，且 DB 截至 2026-06-26 使末端 hold 期略有截斷。**新基準用於與後續 round 比較。**
+
 ### 預測品質（eval_forecast，來自 `docs/finetune_tw_predictor_retrain_analysis.md`）
 
 | 指標 | Pretrained | **Round 0** | 說明 |
@@ -85,17 +94,12 @@ val_ic **全程為負**，early stop 只能選最不壞的 checkpoint。
 
 ## Week 1 策略改進（不重訓，2026-06-26）
 
-**Branch：** `feature/atr-vol-open-ic`
+**Branch：** `feature/atr-vol-open-ic`  
+**計劃來源：** `autoresearch/improve-260626-1240/improvement-plan.md`
 
-### M1 — ATR Position Sizing（`--use-atr-weights`）
-
-用模型預測的 `(high-low)/close` 作為前向波動估計，position size ∝ 1/pred_ATR。  
-**結果：** 無明顯改善，維持等權重。
-
-### M3 — Volume 信心過濾器
-
-排除預測 volume 落底 25% 的低流動性股票。  
-**結果：** 無改善。git commit `ba13774` 直接移除此功能。
+**驗證的方法（260626）：**
+- ✅ **M1** ATR Position Sizing（`--use-atr-weights`）：position size ∝ 1/pred_ATR → **結論：無明顯改善，維持等權重**
+- ✅ **M3** Volume 信心過濾器：排除預測 volume 底 25% 的低流動性股 → **結論：無改善，commit ba13774 移除**
 
 → **結論：策略層面的改動（ATR sizing、volume filter）對 Sharpe/MaxDD 無明顯幫助。**
 
@@ -104,11 +108,13 @@ val_ic **全程為負**，early stop 只能選最不壞的 checkpoint。
 ## Round 2 — 2026-06-22（略輸 Round 0）
 
 **起點：** Round 0 predictor（`j835111/kronos-tw-finetune@round-0`）  
-**調整（依 `autoresearch/improve-260622-0042/improvement-plan.md`）：**
-- IC-IR@h5 early stopping（從 val_ic 均值改為 IC/σ(IC) at h5）
-- 擴大驗證集：ic_val_symbols=300, ic_val_dates=20
-- 從 Round 0 起點（非 pretrained）
-- epochs=20, lr=5e-5, warmup cosine
+**計劃來源：** `autoresearch/improve-260622-0042/improvement-plan.md`
+
+**驗證的方法（260622）：**
+- ✅ **M1** IC-IR@h5 early stopping（從 val_ic 均值改為 IC/σ(IC) at h5）→ **結論：有效提升 SNR，但無法改善回測**
+- ✅ **M2** 驗證集 300×20（6000 樣本，σ(IC)↓ ~0.035）→ **結論：統計噪音降低，但模型仍退化**
+- ✅ **M3** 從 Round 0 起點（非 pretrained）→ **結論：正確起點，不再從零重學**
+- ✅ **M4** Warmup+Cosine, epochs=20, lr=5e-5 → **結論：訓練排程本身沒問題，問題在模型退化方向**
 
 **Best epoch：** 4，ic_ir_h5=0.4066  
 **HF：** `j835111/kronos-tw-finetune@round-2`
@@ -127,9 +133,11 @@ val_ic **全程為負**，early stop 只能選最不壞的 checkpoint。
 
 **起點：** Round 0 predictor  
 **平台：** RunPod A40（從 MoLab 遷移）  
-**調整（依 `autoresearch/improve-260626-1240/improvement-plan.md` Week 2-3）：**
-- **M2**：IC early stopping 改為 open-to-open（`ic_validation.py` 全面修改，`realized_return = open[T+h+1]/open[T+1]-1`）
-- **N2**：擴大驗證集 ic_val_symbols=500, ic_val_dates=40
+**計劃來源：** `autoresearch/improve-260626-1240/improvement-plan.md` Week 2-3
+
+**驗證的方法（260626）：**
+- ✅ **M2** Open-to-open IC early stopping（`realized_return = open[T+h+1]/open[T+1]-1`）→ **結論：IC-IR@h5 信號極弱（best=0.023），無法有效選 checkpoint，大幅退步**
+- ✅ **N2** 擴大驗證集 500×40 → **結論：每 epoch validation 耗時 60-90 分鐘，效率過低，後續縮回**
 
 ### 訓練歷程（`finetune_tw/outputs/tw_daily/train_log_round3.csv`）
 
@@ -164,6 +172,128 @@ val_ic **全程為負**，early stop 只能選最不壞的 checkpoint。
 
 ---
 
+## Step 1 — Open/Open v2 完整 Grid Search — 2026-06-29
+
+**平台：** RunPod RTX 4090  
+**模型：** Round 0（`j835111/kronos-tw-finetune@round-0`）  
+**設定：** open/open v2 signal，1090 symbols，test 2024-07-01 → 2026-06-29  
+**目的：** 確認是否有 top_k × hold_days 組合可超越 Round 0（Sharpe 1.356）
+
+### 結果矩陣
+
+| top_k | hold=5d Sharpe | hold=5d Ann | hold=5d MaxDD | hold=7d Sharpe | hold=7d Ann | hold=7d MaxDD |
+|------:|:--------------:|:-----------:|:-------------:|:--------------:|:-----------:|:-------------:|
+| 5 | 0.641 | 18.8% | 38.9% | 0.341 | 5.8% | 47.0% |
+| **10** | 1.115 | 38.6% | 35.0% | 1.118 | 40.2% | 38.6% |
+| 15 | 1.158 | 38.6% | 38.2% | 1.237 | 43.5% | 37.3% |
+| 20 | 1.215 | 39.7% | 37.6% | 1.255 | 42.1% | 36.1% |
+| 30 | 1.119 | 33.9% | 37.7% | 1.263 | 39.9% | 35.3% |
+| Benchmark ^TWII | 1.47 | 41.2% | 28.7% | — | — | — |
+
+> 注意：原始 Round 0 基準（Sharpe 1.356）是用稍早的 test end date 測得；本次測試延長至 2026-06-29，top_k=10 hold=5d 結果為 1.115，差距部分來自測試期間延長。
+
+**結論：無任何組合超越 Round 0。**
+- 最高 Sharpe 1.263（top_k=30, hold=7d），仍遠低於目標 1.5
+- MaxDD 全部在 35%+，目標 <20% 根本未觸及
+- top_k=5 特別差（Sharpe 0.64），集中度過高帶來高噪音
+- hold=7d 略優於 hold=5d，但差距微小（+0.05-0.14）
+
+**參考資料：** `finetune_tw/outputs/tw_daily/grid_search_round0_next_open.json`
+
+---
+
+## Step 2 — Label Horizon IC 曲線（eval_forecast）— 2026-06-29
+
+**模型：** Round 0 best_model  
+**目的：** 找出 Round 0 在哪個 horizon (h) 的信號最強，評估換 hold_days 的空間
+
+### IC-IR 曲線（close-to-close，全測試期）
+
+| h | IC | IC-IR | IC>0% | 說明 |
+|--:|:--:|:-----:|:-----:|------|
+| **1** | **0.042** | **0.64** | **73%** | 最強，短期預測力最佳 |
+| 2 | 0.036 | 0.50 | 68% | |
+| 3 | 0.032 | 0.42 | 68% | |
+| 4 | 0.036 | 0.44 | 70% | 小反彈 |
+| 5 | 0.032 | 0.37 | 70% | 目前回測用的 hold |
+| 6 | 0.029 | 0.33 | 62% | |
+| 7 | 0.024 | 0.29 | 61% | |
+| 8 | 0.022 | 0.28 | 64% | |
+| 9 | 0.022 | 0.29 | 66% | |
+| 10 | 0.022 | 0.26 | 61% | |
+
+val_loss（token CE）= **3.6440**（與 Round 0 訓練時一致，模型完整性確認）
+
+**結論：IC-IR 從 h=1 單調下降，h=5 已是明顯衰減區（0.37 vs 0.64）。**
+- h=7 的 IC-IR 僅 0.29，換 hold=7d 理論上更差（與 grid search 結果吻合）
+- h=4 有小反彈但不顯著
+- 不存在「隱藏的更強 horizon」：h>5 全面衰減，換持倉期無法改善
+
+**參考資料：** `finetune_tw/outputs/tw_daily/eval/eval_metrics_finetuned.json`
+
+---
+
+## Round 4 — 2026-06-29（FPT + IC-IR@h1 early stop + extended warmup）
+
+**起點：** Round 0 predictor（`j835111/kronos-tw-finetune@round-0`）  
+**平台：** RunPod A40 48GB  
+**計劃來源：** `autoresearch/improve-260629-1426/improvement-plan.md`  
+**HF：** `j835111/kronos-tw-finetune@round-4`
+
+**驗證的方法（260629）：**
+- ✅ **M1** FPT Selective Freeze：凍結 self_attn + FFN，只訓練 LayerNorm + head（~5-7% 參數）→ **結論：best epoch=1，Round 0 是局部最優，凍結也無法改善**
+- ✅ **M3** Label Horizon h1 + Extended Warmup（pct_start=0.08, div_factor=25）→ **結論：warmup 對退化無效**
+- ⚠️ **M2（部分）** IC-IR@h1 early stopping：計劃要求 close-to-close IC（SNR=0.64），**實際實作為 open-to-open IC-IR@h1**（公式已確認對齊，但不是計劃中的 close 版本）→ **close-to-close IC-IR@h1 尚未測試**
+
+### 訓練歷程
+
+| Epoch | train_loss | val_loss | IC-IR@h1 | 備注 |
+|-------|-----------|---------|----------|------|
+| **1** | — | **3.665** | **0.3246** | ← **Best（首 epoch 即最佳）** |
+| 2–7 | — | 持續上升 | 衰減 | no_improve 累積 |
+| 7 | — | — | — | Early Stop |
+
+**Best epoch = 1**，說明從 Round 0 繼續微調幾乎沒有可學習空間。
+
+### 回測結果
+
+**backtest.py（close-to-close signal）**
+
+| hold | Ann | Sharpe | MaxDD |
+|------|-----|--------|-------|
+| **5d** | 44.46% | 1.17 | 34.10% |
+| 10d | −0.53% | 0.17 | 44.40% |
+| 15d | 17.76% | 0.65 | 36.01% |
+
+**backtest_next_open.py（open/open v2，top_k=10）**
+
+| hold | Ann | Sharpe | MaxDD |
+|------|-----|--------|-------|
+| **5d** | **45.94%** | **1.24** | 33.99% |
+| 10d | 13.29% | 0.53 | 37.37% |
+| 15d | 19.50% | 0.68 | 41.76% |
+
+**與 Round 0 對比（open/open v2，top_k=10，hold=5d）：**
+
+| 指標 | Round 0 | Round 4 | 差距 |
+|------|---------|---------|------|
+| Sharpe | **1.356** | 1.24 | −0.116 |
+| Ann | **50%** | 45.94% | −4% |
+| MaxDD | 35% | 33.99% | +1%（略優）|
+
+**失敗分析：**
+1. **Best epoch = 1**：模型在第一個 epoch 就達到 IC-IR 最高點，之後持續退化——說明 Round 0 已是此 fine-tuning 路徑的局部最優，FPT 也無法改善
+2. **FPT 未能突破局部最優**：凍結 95% 參數本意是防止 forgetting，但也限制了模型調整排名能力的空間
+3. **Round 0 → fine-tune 邊際效益極低**：累計四輪 retraining 皆退步，結論明確
+
+**參考資料：**
+- `finetune_tw/outputs/tw_daily/backtest_round4.png`
+- `finetune_tw/outputs/tw_daily/backtest_round4_next_open.png`
+- `finetune_tw/outputs/tw_daily/backtest_returns_round4.json`
+- `finetune_tw/outputs/tw_daily/backtest_returns_round4_next_open.json`
+
+---
+
 ## 各輪 Sharpe 彙整（open/open v2，top_k=10，hold=5d）
 
 | 版本 | Sharpe | Ann | MaxDD | 備注 |
@@ -172,6 +302,7 @@ val_ic **全程為負**，early stop 只能選最不壞的 checkpoint。
 | Round 1 | 0.15 | -0.1% | 35% | 起點錯誤（pretrained）|
 | Round 2 | 1.14 | 38% | 36% | close IC，輸 Round 0 |
 | Round 3 | 0.50 | 20% | 41% | open IC，大幅退步 |
+| Round 4 | 1.24 | 46% | 34% | FPT + IC-IR@h1，輸 Round 0 |
 
 ---
 
@@ -179,13 +310,53 @@ val_ic **全程為負**，early stop 只能選最不壞的 checkpoint。
 
 **Round 0 是目前唯一可執行的版本（Sharpe 1.356）。**
 
-重訓（Round 1-3）及策略改動（ATR sizing、volume filter）均無法超越 Round 0：
-- Kronos-base 在 TWSE daily data fine-tune 後已達局部最優
-- 進一步 fine-tune 破壞泛化能力（forgetting）
-- open-to-open IC 比 close-to-close IC 更難優化（噪音更高，SNR 更低）
-- ATR sizing 和 volume filter 在策略層面也無法改善指標
+策略層面的調整空間已完全耗盡（2026-06-29 確認）：
+- 重訓（Round 1-4）：全部退步，Round 0 是 fine-tune 路徑的局部最優
+- 策略參數（ATR sizing、volume filter）：no-op
+- Stacking / MC ensemble：有害
+- Grid search（所有 top_k × hold_days）：最高 Sharpe 1.263，無法突破 1.356
+- Label Horizon 掃描：IC-IR 從 h=1 單調衰減，換 hold_days 無效
+- FPT freeze（Round 4）：best epoch=1，無任何可學習空間
 
-**若要繼續提升，建議方向（按信心由高到低）：**
-1. **N3（Label Horizon 掃描）**：嘗試 IC validation at h=3, h=7——最優訓練 label horizon 可能不是 h=5（arxiv:2602.03395, ICML 2026 Label Horizon Paradox）
-2. **N1（Ranking Loss）**：加入 pairwise IC auxiliary loss，直接在訓練時優化排名（arxiv:2510.14156, CIKM 2025）
-3. **從 pretrained 重新 fine-tune**（非從 Round 0）：避免局部最優問題，同時重訓 tokenizer + predictor，配合 open-to-open IC early stopping
+**若要繼續提升，唯一有意義的方向：**
+1. **從 pretrained 完全重啟**（非從 Round 0）：避免局部最優，同時重訓 tokenizer + predictor，配合 open-to-open IC early stopping。這是根本性路線重置。
+2. **N1（Ranking Loss）**：加入 pairwise IC auxiliary loss 直接優化排名（arxiv:2510.14156, CIKM 2025），需配合 pretrained 重啟一起嘗試。
+
+---
+
+## Autoresearch 方法完整對照表
+
+### 已驗證（各輪結果）
+
+| 方法 | 來源計劃 | 驗證輪次 | 結果 |
+|------|---------|---------|------|
+| 從 Round 0 起點（非 pretrained）| 260622 M3 | Round 2 | ✅ 必要條件（Round 1 用 pretrained 失敗） |
+| IC-IR@h5 early stopping | 260622 M1 | Round 2 | ❌ 輸 Round 0（Sharpe 1.14） |
+| 驗證集 300×20 | 260622 M2 | Round 2 | ⚠️ 噪音降低但模型仍退化 |
+| Warmup+Cosine, epochs=20 | 260622 M4 | Round 2 | ⚠️ 排程沒問題，問題是退化方向 |
+| ATR position sizing（1/pred_ATR）| 260626 M1 | Week 1 | ❌ 無改善，已移除 |
+| Volume filter（底 25% 排除）| 260626 M3 | Week 1 | ❌ 無改善，已移除 |
+| Open-to-open IC early stopping（h5）| 260626 M2 | Round 3 | ❌ IC-IR@h5=0.023，信號極弱，大幅退步 |
+| 驗證集 500×40 | 260626 N2 | Round 3 | ❌ 過慢（60-90 min/epoch），縮回 150×40 |
+| FPT Selective Freeze | 260629 M1 | Round 4 | ❌ best epoch=1，Round 0 局部最優 |
+| IC-IR@h1 early stopping（open-to-open）= Label Horizon h=1 代理標籤 | 260629 M3 / 260622 N2 / 260626 N3 | Round 4 | ❌ 首 epoch 即最佳，之後退化，Round 0 無學習空間 |
+| Extended Warmup（pct=0.08, div=25）| 260629 M3 | Round 4 | ❌ 對退化無效 |
+| Stacking（LightGBM，MC=5/10）| — | 獨立實驗 | ❌ 有害（-0.20 Sharpe），已移除 |
+| MC ensemble（mc_mean）| — | 獨立實驗 | ❌ 有害（Sharpe 1.07 < benchmark 1.60）|
+
+### 未驗證（autoresearch 有記錄，從未測試）
+
+| 方法 | 來源計劃 | 優先度 | 說明 |
+|------|---------|--------|------|
+| **Close-to-close IC-IR@h1 early stopping** | 260629 M2 | 🔴 高 | Round 4 用的是 open-to-open h1；close 版 SNR=0.64 從未測試。**需配合 pretrained 重啟** |
+| **Auxiliary Ranking Loss（Pairwise IC loss）** | 260622 N1, 260626 N1, 260629 N1 | 🔴 高 | 三份計劃都有，文獻最強（arxiv:2510.14156, 2509.10461）。直接優化截面排名而非 token CE。**需改 DataLoader 按日期分組 batch**，需配合 pretrained 重啟才有學習空間 |
+| **Training loss primary horizon 改為 h3/h7**（改訓練目標本身）| 260622 N2, 260626 N3 | 🟡 中 | 注意區分：用短 horizon 作為 **early stop metric** 已在 Round 4 測試（h=1，失敗）。這裡指的是更強版本——把 h=3 作為 **training loss 的 primary target**（取代均值），讓模型在訓練期間就直接優化短期預測。Label Horizon Paradox（arxiv:2602.03395）支持此方向，但未測試 |
+| **Horizon-Weighted Loss**（h4/h5 weight 更高）| 260622 N3 | 🟡 中 | 不需要架構改動，但需要重訓 |
+| **Price-space MSE 輔助損失** | 260626 S1 | 🟠 低（moonshot）| 解碼 token → price，計算 MSE；需改 tokenizer |
+| **ic_val_dates 至 60** | 260629 N2 | 🟠 低 | SE(IC-IR)=0.14，統計力充足；目前用 40 |
+| **連續回歸 head / Chronos-2 架構** | 260626 S2 | 🔵 研究級 | 拋棄 BSQ 離散化，論文級工作量 |
+| **Listwise Ranking Loss（ListMLE/ApproxNDCG）**| 260622 S1 | 🔵 研究級 | 需重構整個 training loop |
+
+**關鍵未驗證組合（最值得嘗試）：**  
+`pretrained 完全重啟 + close-to-close IC-IR@h1 early stopping + Auxiliary Ranking Loss`  
+→ 解決局部最優問題，同時直接對排名目標優化，文獻支撐最強。

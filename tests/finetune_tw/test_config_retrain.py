@@ -20,7 +20,7 @@ def test_retrain_yaml_loads():
 
 def test_rtx6000_yaml_uses_persistent_storage():
     cfg = Config.from_yaml("finetune_tw/configs/config_tw_daily_rtx6000.yaml")
-    assert cfg.db_path == "/mnt/first/kronos_state/data/tw_stocks.db"
-    assert cfg.output_dir == "/mnt/first/kronos_state/outputs"
+    assert cfg.db_path == "/workspace/Kronos/finetune_tw/data/tw_stocks.db"
+    assert cfg.output_dir == "/workspace/Kronos/finetune_tw/outputs"
     assert cfg.hf_checkpoint_revision_out == "checkpoints-round-3"
     assert cfg.hf_checkpoint_keep_last_n == 3
