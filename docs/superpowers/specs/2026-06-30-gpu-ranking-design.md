@@ -2,7 +2,7 @@
 
 ## Goal
 
-Reduce CPU work introduced after `49cc85c7208e99f726582c77ff2012e434e22e1f`, keep most compute on GPU during training, and preserve current function signatures plus config compatibility.
+Reduce CPU work introduced after `49cc85c7208e99f726582c77ff2012e434e22e1f`, keep most compute on GPU during training, exploit the available ~50 GB RAM budget aggressively where it simplifies hot paths, and preserve current function signatures plus config compatibility.
 
 ## Scope
 
@@ -30,13 +30,13 @@ Oracle construction currently normalizes windows on CPU, tokenizes in batches, t
 
 ## Recommended Approach
 
-Use a mixed in-memory and batched-tensor refactor:
+Use an aggressively memory-backed refactor:
 
-1. Move cross-sectional ranking data access from per-step DB queries to one-time in-memory preload.
-2. Replace oracle sample-by-sample accumulation with batched tensor accumulation.
+1. Move cross-sectional ranking data access from per-step DB queries to one-time in-memory preload and precomputed per-date sample pools.
+2. Replace oracle sample-by-sample accumulation with batched tensor accumulation using larger in-memory buffers.
 3. Implement real optimizer stepping across `grad_accum_steps` microbatches.
 
-This removes the dominant CPU bottlenecks without changing call sites or adding new cache invalidation complexity.
+This removes the dominant CPU bottlenecks without changing call sites or adding new cache invalidation complexity, and intentionally spends RAM to minimize repeated CPU preprocessing.
 
 ## Detailed Design
 
@@ -50,14 +50,19 @@ Internal changes:
 - Store per-symbol feature arrays as `float32` numpy arrays.
 - Store per-symbol date arrays in sorted order and precomputed stamp arrays.
 - Build the sampler date pool from actual dates present in loaded data, filtered to dates that can satisfy the requested lookback and horizon.
-- Maintain a lightweight mapping from date string to candidate symbol/index pairs to avoid rescanning the full universe during each step.
+- Precompute per-date candidate symbol/index pairs once.
+- Precompute or eagerly materialize per-date ranking sample pools as contiguous arrays where practical:
+  - normalized context windows
+  - stamp windows
+  - realized `open[T+h+1]/open[T+1]-1`
+  - symbol/date index metadata needed internally
+- Prefer spending RAM up front over repeating normalization and index lookup work inside the training loop.
 
 Sampling flow:
 
 - Draw one valid trading date from the precomputed date pool.
-- Select up to `n_stocks` valid symbol/index pairs for that date.
-- Slice context/future windows directly from numpy arrays.
-- Perform normalization on array slices without pandas.
+- Select up to `n_stocks` valid precomputed samples for that date.
+- Slice or gather directly from contiguous in-memory arrays.
 - Return the same dictionary keys and tensor shapes as today.
 
 Expected result:
@@ -78,6 +83,7 @@ Internal changes:
   - token counts
   - token return sums
   using tensor operations instead of Python accumulation.
+- Use larger in-memory staging buffers before reduction, since the available RAM budget is generous relative to the expected token-id and return arrays.
 - Use `scatter_add_` or equivalent indexed accumulation on tensors.
 - Keep fallback handling for edge cases and unsupported sample shapes so existing tests and callers remain valid.
 
@@ -147,7 +153,7 @@ Add or update tests to verify:
 
 ### Memory usage
 
-Preloading cross-sectional data increases RAM usage. This is acceptable because the training dataset is already materially memory-backed, and the refactor trades RAM for much lower per-step CPU overhead.
+Preloading cross-sectional data and eagerly materializing date-indexed sample pools increases RAM usage. This is acceptable because the stated environment has roughly 50 GB available, and the refactor intentionally trades RAM for much lower per-step CPU overhead.
 
 ### Date index correctness
 
