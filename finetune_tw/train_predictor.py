@@ -235,6 +235,79 @@ def _build_token_cache(
     return paths["data"]
 
 
+def _iter_s1_oracle_samples(dataset, tokenizer, device, batch_size: int = 256):
+    encode_batch_size = max(1, int(batch_size))
+    norm_windows: list[np.ndarray] = []
+    open_windows: list[np.ndarray] = []
+    lookback = int(dataset.lookback_window)
+    window = int(dataset.window)
+    clip = float(dataset.clip)
+
+    def flush():
+        if not norm_windows:
+            return
+        batch_x = torch.from_numpy(np.stack(norm_windows, axis=0)).to(device=device, dtype=torch.float32)
+        with torch.no_grad():
+            s1_ids, _ = tokenizer.encode(batch_x, half=True)
+        s1_ids = torch.as_tensor(s1_ids, dtype=torch.long).cpu()
+        for row_ids, open_prices in zip(s1_ids, open_windows):
+            yield {
+                "s1_ids": row_ids[:lookback].clone(),
+                "open_prices": torch.from_numpy(open_prices.copy()),
+            }
+        norm_windows.clear()
+        open_windows.clear()
+
+    for sym, start in dataset._samples:
+        raw_window = dataset._data[sym][start : start + window].astype(np.float32, copy=True)
+        past = raw_window[:lookback]
+        mean = past.mean(axis=0)
+        std = past.std(axis=0) + 1e-5
+        norm_windows.append(np.clip((raw_window - mean) / std, -clip, clip).astype(np.float32, copy=False))
+        open_windows.append(raw_window[:, 0])
+        if len(norm_windows) >= encode_batch_size:
+            yield from flush()
+
+    yield from flush()
+
+
+def _build_ranking_stamps(batch_x: torch.Tensor, device: torch.device) -> torch.Tensor:
+    batch_size, seq_len, _ = batch_x.shape
+    stamps = torch.zeros((batch_size, seq_len, 5), device=device, dtype=torch.float32)
+    stamps[:, :, 1] = 9.0
+    return stamps
+
+
+def _run_cross_sectional_ranking_step(
+    cfg,
+    device,
+    tokenizer,
+    predictor,
+    cross_sampler,
+    oracle_table,
+    step_seed,
+):
+    from finetune_tw.score_oracle import oracle_pred_score
+
+    batch = cross_sampler.sample_date_batch(cfg.cross_sectional_batch_size, seed=step_seed)
+    if batch["actual_return_h"].numel() == 0:
+        return None
+
+    batch_x = batch["x"].to(device=device, dtype=torch.float32, non_blocking=True)
+    actual_returns = batch["actual_return_h"].to(device=device, dtype=torch.float32, non_blocking=True)
+    ranking_stamps = _build_ranking_stamps(batch_x, device)
+
+    with torch.no_grad():
+        s1_ids, s2_ids = tokenizer.encode(batch_x, half=True)
+        s1_ids = torch.as_tensor(s1_ids, device=device, dtype=torch.long)
+        s2_ids = torch.as_tensor(s2_ids, device=device, dtype=torch.long)
+
+    predictor_outputs = predictor(s1_ids, s2_ids, ranking_stamps)
+    s1_logits = predictor_outputs[0] if isinstance(predictor_outputs, (tuple, list)) else predictor_outputs
+    pred_scores = oracle_pred_score(s1_logits[:, -1, :], oracle_table)
+    return differentiable_rank_ic_loss(pred_scores, actual_returns)
+
+
 def _steps_for_epoch(loader_len: int, step_cap: int) -> int:
     return min(loader_len, step_cap) if step_cap > 0 else loader_len
 
@@ -552,6 +625,41 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
         log_path.write_text(f"epoch,step,train_loss,val_loss,val_ic,ic_ir_h{ic_target_h}\n")
 
     predictor = KronosPredictor(model, tokenizer, device=device, max_context=cfg.max_context)
+    ranking_loss_alpha = float(getattr(cfg, "ranking_loss_alpha", 0.0))
+    ranking_loss_horizon = int(getattr(cfg, "ranking_loss_horizon", 5))
+    ranking_loss_every_n_steps = max(1, int(getattr(cfg, "ranking_loss_every_n_steps", 5)))
+    oracle_table = None
+    cross_sampler = None
+    if ranking_loss_alpha > 0.0:
+        from finetune_tw.cross_sectional_dataset import CrossSectionalDateSampler
+        from finetune_tw.score_oracle import build_s1_oracle_from_samples
+
+        print(f"  Building S1 oracle (horizon={ranking_loss_horizon})...")
+        oracle_samples = _iter_s1_oracle_samples(
+            train_ds,
+            tokenizer,
+            device,
+            batch_size=cfg.batch_size,
+        )
+        oracle_table = build_s1_oracle_from_samples(
+            samples=oracle_samples,
+            horizon=ranking_loss_horizon,
+            min_count=cfg.oracle_min_count,
+            vocab_size=int(getattr(model, "s1_vocab_size", 2 ** int(tokenizer.s1_bits))),
+        ).to(device)
+        nonzero = int((oracle_table != 0).sum().item())
+        print(f"  Oracle built: {nonzero}/{oracle_table.numel()} populated entries.")
+        cross_sampler = CrossSectionalDateSampler(
+            cfg.db_path,
+            cfg.lookback_window,
+            ranking_loss_horizon,
+            "2015-01-01",
+            cfg.train_end_date,
+            clip=cfg.clip,
+            seed=cfg.seed,
+            benchmark_symbol=cfg.benchmark_symbol,
+        )
+
     all_syms = [s for s in list_symbols(cfg.db_path) if s != cfg.benchmark_symbol]
     val_universe = pick_val_universe(all_syms, cfg.ic_val_symbols, cfg.seed)
     val_dates = pick_val_dates(cfg.train_end_date, cfg.val_end_date, cfg.ic_val_dates)
@@ -598,7 +706,22 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
             ):
                 logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
                 loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
-                total_loss = _combine_training_loss(loss, cfg.ranking_loss_alpha)
+                ranking_loss = None
+                if (
+                    oracle_table is not None
+                    and cross_sampler is not None
+                    and global_step % ranking_loss_every_n_steps == 0
+                ):
+                    ranking_loss = _run_cross_sectional_ranking_step(
+                        cfg=cfg,
+                        device=device,
+                        tokenizer=tokenizer,
+                        predictor=model,
+                        cross_sampler=cross_sampler,
+                        oracle_table=oracle_table,
+                        step_seed=cfg.seed + global_step,
+                    )
+                total_loss = _combine_training_loss(loss, ranking_loss_alpha, ranking_loss)
 
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:
