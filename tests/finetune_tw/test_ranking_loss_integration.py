@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,6 +30,9 @@ class _ToyPredictor(nn.Module):
 
 
 class _ToyCrossSampler:
+    def __init__(self) -> None:
+        self.last_batch = None
+
     def sample_date_batch(self, n_stocks, seed=None):
         del seed
         assert n_stocks == 3
@@ -40,11 +44,53 @@ class _ToyCrossSampler:
             ],
             dtype=torch.float32,
         )
-        return {
+        stamps = torch.tensor(
+            [
+                [[0.0, 9.0, 1.0, 2.0, 1.0], [0.0, 9.0, 2.0, 3.0, 1.0], [0.0, 9.0, 3.0, 4.0, 1.0], [0.0, 9.0, 4.0, 5.0, 1.0]],
+                [[0.0, 10.0, 1.0, 6.0, 2.0], [0.0, 10.0, 2.0, 7.0, 2.0], [0.0, 10.0, 3.0, 8.0, 2.0], [0.0, 10.0, 4.0, 9.0, 2.0]],
+                [[0.0, 11.0, 1.0, 10.0, 3.0], [0.0, 11.0, 2.0, 11.0, 3.0], [0.0, 11.0, 3.0, 12.0, 3.0], [0.0, 11.0, 4.0, 13.0, 3.0]],
+            ],
+            dtype=torch.float32,
+        )
+        batch = {
             "x": x,
-            "stamps": torch.zeros((3, 4, 5), dtype=torch.float32),
+            "stamps": stamps,
             "actual_return_h": torch.tensor([0.25, -0.10, 0.05], dtype=torch.float32),
             "date": "2024-01-02",
+        }
+        self.last_batch = {
+            key: value.clone() if torch.is_tensor(value) else value
+            for key, value in batch.items()
+        }
+        return batch
+
+
+class _OracleTokenizer:
+    def encode(self, x, half=True):
+        del half
+        batch_size, seq_len, _ = x.shape
+        ids = torch.arange(seq_len, dtype=torch.long).repeat(batch_size, 1)
+        return ids, ids
+
+
+class _OracleDataset:
+    def __init__(self) -> None:
+        self.lookback_window = 4
+        self.window = 6
+        self.clip = 5.0
+        self._samples = [("AAA", 0)]
+        self._data = {
+            "AAA": np.array(
+                [
+                    [10.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [11.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [12.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [13.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [14.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [15.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ],
+                dtype=np.float32,
+            )
         }
 
 
@@ -76,7 +122,11 @@ def test_run_cross_sectional_ranking_step_runs_without_error():
     assert loss is not None
     assert predictor.last_stamp is not None
     assert predictor.last_stamp.shape == (3, 4, 5)
-    assert torch.allclose(predictor.last_stamp[:, :, 1], torch.full((3, 4), 9.0))
+    assert cross_sampler.last_batch is not None
+    assert torch.equal(
+        predictor.last_stamp,
+        cross_sampler.last_batch["stamps"].to(device),
+    )
 
 
 def test_run_cross_sectional_ranking_step_returns_finite_scalar():
@@ -119,3 +169,23 @@ def test_run_cross_sectional_ranking_step_backpropagates_to_predictor_params():
 
     assert predictor.logit_scale.grad is not None
     assert torch.isfinite(predictor.logit_scale.grad)
+
+
+def test_iter_s1_oracle_samples_uses_bar_t_token_for_oracle_key():
+    from finetune_tw.train_predictor import _iter_s1_oracle_samples
+
+    dataset = _OracleDataset()
+    tokenizer = _OracleTokenizer()
+
+    samples = list(
+        _iter_s1_oracle_samples(
+            dataset=dataset,
+            tokenizer=tokenizer,
+            device=torch.device("cpu"),
+            batch_size=1,
+        )
+    )
+
+    assert len(samples) == 1
+    assert samples[0]["s1_ids"].shape == (dataset.lookback_window,)
+    assert samples[0]["s1_ids"][-1].item() == dataset.lookback_window

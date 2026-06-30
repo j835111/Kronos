@@ -251,8 +251,10 @@ def _iter_s1_oracle_samples(dataset, tokenizer, device, batch_size: int = 256):
             s1_ids, _ = tokenizer.encode(batch_x, half=True)
         s1_ids = torch.as_tensor(s1_ids, dtype=torch.long).cpu()
         for row_ids, open_prices in zip(s1_ids, open_windows):
+            oracle_ids = row_ids[:lookback].clone()
+            oracle_ids[-1] = row_ids[lookback]
             yield {
-                "s1_ids": row_ids[:lookback].clone(),
+                "s1_ids": oracle_ids,
                 "open_prices": torch.from_numpy(open_prices.copy()),
             }
         norm_windows.clear()
@@ -297,7 +299,7 @@ def _run_cross_sectional_ranking_step(
 
     batch_x = batch["x"].to(device=device, dtype=torch.float32, non_blocking=True)
     actual_returns = batch["actual_return_h"].to(device=device, dtype=torch.float32, non_blocking=True)
-    ranking_stamps = _build_ranking_stamps(batch_x, device)
+    ranking_stamps = batch["stamps"].to(device)
 
     with torch.no_grad():
         s1_ids, s2_ids = tokenizer.encode(batch_x, half=True)
