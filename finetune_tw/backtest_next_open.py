@@ -592,7 +592,7 @@ def main() -> None:
     parser.add_argument(
         "--model",
         required=True,
-        choices=["pretrained", "round0", "round1", "round2", "round3", "round4"],
+        choices=["pretrained", "round0", "round1", "round2", "round3", "round4", "round5"],
         help="Which model weights to load",
     )
     parser.add_argument(
