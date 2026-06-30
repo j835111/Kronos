@@ -23,6 +23,11 @@ from finetune_tw.backtest import (
     rank_stocks,
     signals_to_holdings,
 )
+from finetune_tw.backtest_data import (
+    build_rebalance_inputs,
+    load_price_frame_fields,
+    load_symbol_history_frames,
+)
 from finetune_tw.config import Config
 from finetune_tw.db import list_symbols, query_symbol
 
@@ -72,16 +77,13 @@ def _load_price_frames(
     symbols: list[str],
     end: str,
 ) -> dict[str, pd.DataFrame]:
-    price_frames: dict[str, pd.DataFrame] = {}
-    for sym in symbols:
-        df = query_symbol(cfg.db_path, sym, start=cfg.test_start_date, end=end)
-        if df.empty:
-            continue
-        frame = df.loc[:, ["date", "open", "close"]].copy()
-        frame["date"] = pd.to_datetime(frame["date"])
-        frame = frame.set_index("date").sort_index()
-        price_frames[sym] = frame
-    return price_frames
+    return load_price_frame_fields(
+        cfg.db_path,
+        symbols,
+        start=cfg.test_start_date,
+        end=end,
+        fields=["open", "close"],
+    )
 
 
 def compute_raw_signals_open(
@@ -100,25 +102,34 @@ def compute_raw_signals_open(
     """
     BATCH_SIZE = 64
     raw_preds: dict[str, dict[str, pd.Series]] = {}
+    if len(rebal_dates) == 0:
+        return raw_preds
+
+    preload_start = (
+        pd.Timestamp(rebal_dates.min()) - pd.Timedelta(days=cfg.lookback_window * 2)
+    ).strftime("%Y-%m-%d")
+    preload_end = pd.Timestamp(rebal_dates.max()).strftime("%Y-%m-%d")
+    history_frames = load_symbol_history_frames(
+        cfg.db_path,
+        symbols,
+        start=preload_start,
+        end=preload_end,
+    )
 
     for i, rebal_date in enumerate(rebal_dates):
         rebal_str = rebal_date.strftime("%Y-%m-%d")
-        lookback_start = (rebal_date - pd.Timedelta(days=cfg.lookback_window * 2)).strftime("%Y-%m-%d")
-        y_ts = pd.date_range(rebal_date, periods=pred_len, freq="B")
-
-        batch_syms, batch_dfs, batch_xts, batch_yts = [], [], [], []
-        for sym in symbols:
-            df = query_symbol(cfg.db_path, sym, start=lookback_start, end=rebal_str)
-            if len(df) < cfg.lookback_window:
-                continue
-            ctx = df.iloc[-cfg.lookback_window:]
-            ctx_df = ctx[["open", "high", "low", "close", "volume", "amount"]].reset_index(drop=True)
-            if ctx_df.isnull().any().any():
-                continue
-            batch_syms.append(sym)
-            batch_dfs.append(ctx_df)
-            batch_xts.append(pd.to_datetime(ctx["date"]).reset_index(drop=True))
-            batch_yts.append(pd.Series(y_ts))
+        cutoff = rebal_date - pd.Timedelta(days=cfg.lookback_window * 2)
+        recent_history_frames = {
+            sym: frame.loc[frame.index >= cutoff]
+            for sym, frame in history_frames.items()
+        }
+        batch_syms, batch_dfs, batch_xts, batch_yts = build_rebalance_inputs(
+            recent_history_frames,
+            symbols,
+            rebal_date,
+            cfg.lookback_window,
+            pred_len,
+        )
 
         date_preds: dict[str, pd.Series] = {}
         with torch.no_grad():

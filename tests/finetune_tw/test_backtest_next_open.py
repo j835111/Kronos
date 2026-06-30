@@ -61,6 +61,7 @@ class _FakeBatchPredictor:
     def __init__(self, preds: list[pd.DataFrame]):
         self._preds = preds
         self._cursor = 0
+        self.batch_sizes: list[int] = []
 
     def predict_batch(
         self,
@@ -71,6 +72,7 @@ class _FakeBatchPredictor:
         **kwargs,
     ):
         batch_size = len(df_list)
+        self.batch_sizes.append(batch_size)
         start = self._cursor
         end = start + batch_size
         self._cursor = end
@@ -367,6 +369,162 @@ def test_compute_atr_weights_missing_sym():
     assert weights["KNOWN"] == pytest.approx(100.0 / 101.0)
     assert weights["MISSING"] == pytest.approx(1.0 / 101.0)
 
+
+
+def test_compute_raw_signals_open_bulk_preloads_once_and_keeps_pred_frame(monkeypatch):
+    import finetune_tw.backtest_next_open as bo
+
+    cfg = Config(
+        db_path="unused.db",
+        lookback_window=2,
+    )
+    rebal_dates = pd.DatetimeIndex(["2024-01-03", "2024-01-04"])
+    symbols = ["1101.TW", "1216.TW"]
+    preload_calls = []
+
+    history_frames = {
+        "1101.TW": pd.DataFrame(
+            {
+                "open": [10.0, 10.5, 11.0],
+                "high": [10.2, 10.7, 11.2],
+                "low": [9.8, 10.3, 10.8],
+                "close": [10.1, 10.6, 11.1],
+                "volume": [100.0, 110.0, 120.0],
+                "amount": [1_010.0, 1_166.0, 1_332.0],
+            },
+            index=pd.DatetimeIndex(["2024-01-01", "2024-01-02", "2024-01-03"]),
+        ),
+        "1216.TW": pd.DataFrame(
+            {
+                "open": [20.0, 20.5, 21.0],
+                "high": [20.2, 20.7, 21.2],
+                "low": [19.8, 20.3, 20.8],
+                "close": [20.1, 20.6, 21.1],
+                "volume": [200.0, 210.0, 220.0],
+                "amount": [4_020.0, 4_326.0, 4_642.0],
+            },
+            index=pd.DatetimeIndex(["2024-01-01", "2024-01-02", "2024-01-03"]),
+        ),
+    }
+
+    def fake_load_symbol_history_frames(db_path, seen_symbols, start, end):
+        preload_calls.append((db_path, tuple(seen_symbols), start, end))
+        return history_frames
+
+    monkeypatch.setattr(bo, "load_symbol_history_frames", fake_load_symbol_history_frames)
+
+    predictor = _FakeBatchPredictor(
+        [
+            _make_open_prediction_frame(10.0, [10.3, 10.6], volume=100.0),
+            _make_open_prediction_frame(20.0, [20.2, 20.5], volume=200.0),
+            _make_open_prediction_frame(10.0, [10.4, 10.8], volume=100.0),
+            _make_open_prediction_frame(20.0, [20.3, 20.7], volume=200.0),
+        ]
+    )
+
+    raw_preds = bo.compute_raw_signals_open(
+        predictor,
+        cfg,
+        rebal_dates,
+        pred_len=3,
+        symbols=symbols,
+        attach_pred_frame=True,
+    )
+
+    assert preload_calls == [("unused.db", tuple(symbols), "2023-12-30", "2024-01-04")]
+    pred_frame = raw_preds["2024-01-03"]["1101.TW"].attrs["pred_frame"]
+    assert list(pred_frame.columns) == ["high", "low", "close"]
+    assert list(pred_frame.iloc[0]) == pytest.approx([10.5, 9.5, 10.0])
+
+
+def test_compute_raw_signals_open_applies_per_rebalance_recency_cutoff(monkeypatch):
+    import finetune_tw.backtest_next_open as bo
+
+    cfg = Config(
+        db_path="unused.db",
+        lookback_window=2,
+    )
+    rebal_dates = pd.DatetimeIndex(["2024-01-03", "2024-01-08"])
+    symbols = ["SPARSE.TW"]
+
+    history_frames = {
+        "SPARSE.TW": pd.DataFrame(
+            {
+                "open": [10.0, 10.5, 11.0],
+                "high": [10.2, 10.7, 11.2],
+                "low": [9.8, 10.3, 10.8],
+                "close": [10.1, 10.6, 11.1],
+                "volume": [100.0, 110.0, 120.0],
+                "amount": [1_010.0, 1_166.0, 1_332.0],
+            },
+            index=pd.DatetimeIndex(["2024-01-01", "2024-01-02", "2024-01-08"]),
+        )
+    }
+
+    monkeypatch.setattr(bo, "load_symbol_history_frames", lambda *args, **kwargs: history_frames)
+
+    predictor = _FakeBatchPredictor(
+        [_make_open_prediction_frame(10.0, [10.2, 10.4], volume=100.0)]
+    )
+
+    raw_preds = bo.compute_raw_signals_open(
+        predictor,
+        cfg,
+        rebal_dates,
+        pred_len=3,
+        symbols=symbols,
+    )
+
+    assert set(raw_preds) == {"2024-01-03", "2024-01-08"}
+    assert set(raw_preds["2024-01-03"]) == {"SPARSE.TW"}
+    assert raw_preds["2024-01-08"] == {}
+    assert predictor.batch_sizes == [1]
+
+
+def test_load_price_frames_uses_shared_price_loader(monkeypatch):
+    import finetune_tw.backtest_next_open as bo
+
+    cfg = Config(
+        db_path="unused.db",
+        test_start_date="2024-01-01",
+    )
+    seen = {}
+
+    def fake_load_price_frame_fields(db_path, symbols, start, end, fields):
+        seen["call"] = {
+            "db_path": db_path,
+            "symbols": list(symbols),
+            "start": start,
+            "end": end,
+            "fields": list(fields),
+        }
+        return {
+            "1101.TW": pd.DataFrame(
+                {
+                    "open": [10.0, 11.0],
+                    "close": [10.5, 11.5],
+                },
+                index=pd.DatetimeIndex(["2024-01-02", "2024-01-03"]),
+            )
+        }
+
+    monkeypatch.setattr(bo, "load_price_frame_fields", fake_load_price_frame_fields)
+    monkeypatch.setattr(
+        bo,
+        "query_symbol",
+        lambda *args, **kwargs: pytest.fail("_load_price_frames() should not query symbols one by one"),
+    )
+
+    frames = bo._load_price_frames(cfg, ["1101.TW", "1216.TW"], end="2024-01-31")
+
+    assert seen["call"] == {
+        "db_path": "unused.db",
+        "symbols": ["1101.TW", "1216.TW"],
+        "start": "2024-01-01",
+        "end": "2024-01-31",
+        "fields": ["open", "close"],
+    }
+    assert list(frames["1101.TW"].columns) == ["open", "close"]
 
 
 def test_build_portfolio_returns_equal_weight():
