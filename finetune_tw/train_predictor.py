@@ -289,6 +289,8 @@ def _run_cross_sectional_ranking_step(
 ):
     from finetune_tw.score_oracle import oracle_pred_score
 
+    amp_enabled, amp_dtype = _resolve_amp(getattr(cfg, "amp_dtype", None))
+    amp_enabled = amp_enabled and device.type == "cuda"
     batch = cross_sampler.sample_date_batch(cfg.cross_sectional_batch_size, seed=step_seed)
     if batch["actual_return_h"].numel() == 0:
         return None
@@ -302,7 +304,12 @@ def _run_cross_sectional_ranking_step(
         s1_ids = torch.as_tensor(s1_ids, device=device, dtype=torch.long)
         s2_ids = torch.as_tensor(s2_ids, device=device, dtype=torch.long)
 
-    predictor_outputs = predictor(s1_ids, s2_ids, ranking_stamps)
+    with torch.autocast(
+        device_type=device.type,
+        dtype=amp_dtype or torch.bfloat16,
+        enabled=amp_enabled,
+    ):
+        predictor_outputs = predictor(s1_ids, s2_ids, ranking_stamps)
     s1_logits = predictor_outputs[0] if isinstance(predictor_outputs, (tuple, list)) else predictor_outputs
     pred_scores = oracle_pred_score(s1_logits[:, -1, :], oracle_table)
     return differentiable_rank_ic_loss(pred_scores, actual_returns)
@@ -625,6 +632,7 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
         log_path.write_text(f"epoch,step,train_loss,val_loss,val_ic,ic_ir_h{ic_target_h}\n")
 
     predictor = KronosPredictor(model, tokenizer, device=device, max_context=cfg.max_context)
+    grad_accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1)))
     ranking_loss_alpha = float(getattr(cfg, "ranking_loss_alpha", 0.0))
     ranking_loss_horizon = int(getattr(cfg, "ranking_loss_horizon", 5))
     ranking_loss_every_n_steps = max(1, int(getattr(cfg, "ranking_loss_every_n_steps", 5)))
@@ -706,22 +714,25 @@ def run_training(cfg: Config, max_steps: int = -1) -> None:
             ):
                 logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
                 loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
-                ranking_loss = None
-                if (
-                    oracle_table is not None
-                    and cross_sampler is not None
-                    and global_step % ranking_loss_every_n_steps == 0
-                ):
-                    ranking_loss = _run_cross_sectional_ranking_step(
-                        cfg=cfg,
-                        device=device,
-                        tokenizer=tokenizer,
-                        predictor=model,
-                        cross_sampler=cross_sampler,
-                        oracle_table=oracle_table,
-                        step_seed=cfg.seed + global_step,
-                    )
-                total_loss = _combine_training_loss(loss, ranking_loss_alpha, ranking_loss)
+                loss = loss / grad_accum_steps
+
+            ranking_loss = None
+            if (
+                oracle_table is not None
+                and cross_sampler is not None
+                and ranking_loss_alpha > 0
+                and global_step % ranking_loss_every_n_steps == 0
+            ):
+                ranking_loss = _run_cross_sectional_ranking_step(
+                    cfg=cfg,
+                    device=device,
+                    tokenizer=tokenizer,
+                    predictor=model,
+                    cross_sampler=cross_sampler,
+                    oracle_table=oracle_table,
+                    step_seed=cfg.seed + global_step,
+                )
+            total_loss = _combine_training_loss(loss, ranking_loss_alpha, ranking_loss)
 
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:
