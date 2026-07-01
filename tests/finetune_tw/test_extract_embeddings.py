@@ -1,9 +1,10 @@
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 from model.kronos import Kronos, KronosTokenizer, KronosPredictor
-from finetune_tw.extract_embeddings import extract_embeddings_batch
+from finetune_tw.extract_embeddings import compute_technical_features, extract_embeddings_batch
 
 
 def _make_tiny_predictor() -> KronosPredictor:
@@ -81,3 +82,41 @@ def test_extract_embeddings_batch_distinguishes_different_inputs():
     df_list = [_make_df_with_shape("uptrend"), _make_df_with_shape("oscillating")]
     embeddings = extract_embeddings_batch(predictor, df_list, [x_ts, x_ts])
     assert not np.allclose(embeddings[0], embeddings[1])
+
+
+def test_compute_technical_features_matches_hand_calculation():
+    n = 25
+    idx = np.arange(n, dtype=np.float64)
+    close = 100.0 + idx  # 100, 101, ..., 124
+    df = pd.DataFrame({
+        "open": close, "high": close + 0.5, "low": close - 0.5, "close": close,
+        "volume": np.full(n, 200.0), "amount": np.full(n, 20000.0),
+    })
+    # bump the last day's volume so feat_volume_ratio is not exactly 1.0
+    df.loc[df.index[-1], "volume"] = 400.0
+
+    feats = compute_technical_features(df)
+
+    last_close = close[-1]                         # 124.0
+    expected_ma5 = close[-5:].mean()              # mean(120..124) = 122.0
+    expected_ma20 = close[-20:].mean()            # mean(105..124) = 114.5
+    expected_momentum_10 = last_close / close[-11] - 1.0  # 124/114 - 1
+    expected_vol_mean = np.concatenate([np.full(19, 200.0), [400.0]]).mean()
+    expected_vol_ratio = 400.0 / expected_vol_mean
+
+    assert feats["feat_ma5_dist"] == pytest.approx(last_close / expected_ma5 - 1.0)
+    assert feats["feat_ma20_dist"] == pytest.approx(last_close / expected_ma20 - 1.0)
+    assert feats["feat_momentum_10"] == pytest.approx(expected_momentum_10)
+    assert feats["feat_volume_ratio"] == pytest.approx(expected_vol_ratio)
+
+
+def test_compute_technical_features_handles_short_history():
+    n = 3
+    df = pd.DataFrame({
+        "open": [10.0, 11.0, 12.0], "high": [10.5, 11.5, 12.5],
+        "low": [9.5, 10.5, 11.5], "close": [10.0, 11.0, 12.0],
+        "volume": [100.0, 100.0, 100.0], "amount": [1000.0, 1000.0, 1000.0],
+    })
+    feats = compute_technical_features(df)  # must not raise IndexError with < 5/20/11 rows
+    assert set(feats) == {"feat_ma5_dist", "feat_ma20_dist", "feat_momentum_10", "feat_volume_ratio"}
+    assert all(np.isfinite(v) for v in feats.values())

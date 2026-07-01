@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 import xgboost as xgb
@@ -20,7 +21,8 @@ from finetune_tw.backtest_next_open import (
 )
 from finetune_tw.config import Config
 from finetune_tw.db import list_symbols
-from finetune_tw.extract_embeddings import extract_embeddings_batch
+from finetune_tw.extract_embeddings import compute_technical_features, extract_embeddings_batch
+from finetune_tw.train_xgb_lambdarank import _TECH_FEATURE_COLUMNS
 
 BATCH_SIZE = 64
 
@@ -62,8 +64,12 @@ def compute_xgb_signals(
         with torch.no_grad():
             for b in range(0, len(batch_syms), BATCH_SIZE):
                 sub_syms = batch_syms[b:b + BATCH_SIZE]
-                embeddings = extract_embeddings_batch(predictor, batch_dfs[b:b + BATCH_SIZE], batch_xts[b:b + BATCH_SIZE])
-                dmat = xgb.DMatrix(embeddings)
+                sub_dfs = batch_dfs[b:b + BATCH_SIZE]
+                embeddings = extract_embeddings_batch(predictor, sub_dfs, batch_xts[b:b + BATCH_SIZE])
+                tech_feats = np.array([[compute_technical_features(df)[c] for c in _TECH_FEATURE_COLUMNS]
+                                       for df in sub_dfs], dtype=np.float32)
+                features = np.concatenate([embeddings, tech_feats], axis=1)
+                dmat = xgb.DMatrix(features)
                 preds = booster.predict(dmat)
                 for sym, pred in zip(sub_syms, preds):
                     date_scores[sym] = float(pred)

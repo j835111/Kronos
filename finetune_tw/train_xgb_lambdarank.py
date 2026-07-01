@@ -10,6 +10,7 @@ from finetune_tw.ic_validation import rank_ic
 from finetune_tw.lambdarank_ic import lambdarank_ic_objective
 
 EMBEDDING_PREFIX = "emb_"
+_TECH_FEATURE_COLUMNS = ["feat_ma5_dist", "feat_ma20_dist", "feat_momentum_10", "feat_volume_ratio"]
 
 
 def build_group_sizes(df: pd.DataFrame, date_col: str = "date") -> list[int]:
@@ -29,8 +30,10 @@ def rank_ic_eval_metric(preds: np.ndarray, dtrain, group_sizes: list[int]) -> fl
 
 
 def _feature_columns(df: pd.DataFrame) -> list[str]:
-    return sorted([c for c in df.columns if c.startswith(EMBEDDING_PREFIX)],
-                  key=lambda c: int(c[len(EMBEDDING_PREFIX):]))
+    emb_cols = sorted([c for c in df.columns if c.startswith(EMBEDDING_PREFIX)],
+                      key=lambda c: int(c[len(EMBEDDING_PREFIX):]))
+    tech_cols = [c for c in _TECH_FEATURE_COLUMNS if c in df.columns]
+    return emb_cols + tech_cols
 
 
 def train(

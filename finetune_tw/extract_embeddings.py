@@ -55,6 +55,27 @@ def extract_embeddings_batch(
     return pooled.cpu().numpy().astype(np.float32)
 
 
+def compute_technical_features(df: pd.DataFrame) -> dict[str, float]:
+    """Raw technical features as a fallback/complement to the pure Kronos embedding, per
+    improvement-plan.md's open decision point ("純 hidden state vs hidden state + raw features").
+    Computed from the same lookback-window df already passed to extract_embeddings_batch."""
+    close = df["close"].values.astype(np.float64)
+    volume = df["volume"].values.astype(np.float64)
+    last_close = float(close[-1])
+
+    ma5 = float(close[-5:].mean()) if len(close) >= 5 else float(close.mean())
+    ma20 = float(close[-20:].mean()) if len(close) >= 20 else float(close.mean())
+    momentum_10 = float(last_close / close[-11] - 1.0) if len(close) > 10 and close[-11] != 0 else 0.0
+    recent_vol_mean = float(volume[-20:].mean()) if len(volume) >= 20 else float(volume.mean())
+
+    return {
+        "feat_ma5_dist": float(last_close / ma5 - 1.0) if ma5 != 0 else 0.0,
+        "feat_ma20_dist": float(last_close / ma20 - 1.0) if ma20 != 0 else 0.0,
+        "feat_momentum_10": momentum_10,
+        "feat_volume_ratio": float(volume[-1] / recent_vol_mean) if recent_vol_mean != 0 else 1.0,
+    }
+
+
 def _realized_open_to_open_labels(
     price_frames: dict[str, pd.DataFrame],
     symbols: list[str],
@@ -118,9 +139,10 @@ def build_embedding_dataset(
             sub_dfs = kept_dfs[b:b + BATCH_SIZE]
             sub_xts = kept_xts[b:b + BATCH_SIZE]
             embeddings = extract_embeddings_batch(predictor, sub_dfs, sub_xts)
-            for sym, emb in zip(sub_syms, embeddings):
+            for sym, emb, ctx_df in zip(sub_syms, embeddings, sub_dfs):
                 row = {"date": rebal_date.strftime("%Y-%m-%d"), "symbol": sym, "label": labels[sym]}
                 row.update({f"emb_{k}": float(v) for k, v in enumerate(emb)})
+                row.update(compute_technical_features(ctx_df))
                 rows.append(row)
 
         if (i + 1) % 10 == 0 or i == 0:
