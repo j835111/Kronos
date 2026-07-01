@@ -23,6 +23,7 @@ def extract_embeddings_batch(
     predictor,
     df_list: list[pd.DataFrame],
     x_timestamp_list: list[pd.Series],
+    layer_indices: list[int] | None = None,
 ) -> np.ndarray:
     """Mean-pool the frozen Kronos transformer's last-layer hidden state over the lookback window.
 
@@ -49,8 +50,21 @@ def extract_embeddings_batch(
 
     with torch.no_grad():
         s1_ids, s2_ids = predictor.tokenizer.encode(x_tensor, half=True)
-        _, context = predictor.model.decode_s1(s1_ids, s2_ids, x_stamp_tensor)
-        pooled = context.mean(dim=1)  # (B, d_model) mean pooling over the lookback sequence
+        model = predictor.model
+
+        if layer_indices is None:
+            _, context = model.decode_s1(s1_ids, s2_ids, x_stamp_tensor)
+            pooled = context.mean(dim=1)
+        else:
+            x = model.embedding([s1_ids, s2_ids])
+            x = x + model.time_emb(x_stamp_tensor)
+            x = model.token_drop(x)
+            layer_outputs = []
+            for i, layer in enumerate(model.transformer):
+                x = layer(x)
+                if i in layer_indices:
+                    layer_outputs.append(x.mean(dim=1))
+            pooled = torch.cat(layer_outputs, dim=1)
 
     return pooled.cpu().numpy().astype(np.float32)
 

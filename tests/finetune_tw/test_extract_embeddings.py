@@ -27,6 +27,25 @@ def _make_tiny_predictor() -> KronosPredictor:
     return predictor
 
 
+def _make_tiny_predictor_multi_layer(n_layers: int = 3) -> KronosPredictor:
+    torch.manual_seed(0)
+    tokenizer = KronosTokenizer(
+        d_in=6, d_model=8, n_heads=2, ff_dim=16,
+        n_enc_layers=2, n_dec_layers=2,
+        ffn_dropout_p=0.0, attn_dropout_p=0.0, resid_dropout_p=0.0,
+        s1_bits=2, s2_bits=2, beta=1e-2, gamma0=1.0, gamma=1.0, zeta=1.0,
+        group_size=1,
+    )
+    model = Kronos(
+        s1_bits=2, s2_bits=2, n_layers=n_layers, d_model=8, n_heads=2, ff_dim=16,
+        ffn_dropout_p=0.0, attn_dropout_p=0.0, resid_dropout_p=0.0,
+        token_dropout_p=0.0, learn_te=False,
+    )
+    tokenizer.eval()
+    model.eval()
+    return KronosPredictor(model, tokenizer, device="cpu", max_context=64)
+
+
 def _make_df(offset: float, n: int = 20) -> pd.DataFrame:
     idx = np.arange(n, dtype=np.float32)
     return pd.DataFrame({
@@ -55,6 +74,27 @@ def test_extract_embeddings_batch_is_deterministic_in_eval_mode():
     first = extract_embeddings_batch(predictor, df_list, [x_ts])
     second = extract_embeddings_batch(predictor, df_list, [x_ts])
     np.testing.assert_allclose(first, second, rtol=0, atol=0)
+
+
+def test_extract_embeddings_batch_default_layer_indices_matches_old_shape():
+    predictor = _make_tiny_predictor_multi_layer(n_layers=3)
+    df_list = [_make_df(0.0)]
+    x_ts = pd.Series(pd.bdate_range("2024-01-01", periods=20))
+    embeddings = extract_embeddings_batch(predictor, df_list, [x_ts])
+    assert embeddings.shape == (1, 8)  # unchanged: (batch, d_model), backward compatible
+
+
+def test_extract_embeddings_batch_multi_layer_concatenates_selected_layers():
+    predictor = _make_tiny_predictor_multi_layer(n_layers=3)
+    df_list = [_make_df(0.0)]
+    x_ts = pd.Series(pd.bdate_range("2024-01-01", periods=20))
+
+    single_layer = extract_embeddings_batch(predictor, df_list, [x_ts], layer_indices=[0])
+    two_layers = extract_embeddings_batch(predictor, df_list, [x_ts], layer_indices=[0, 2])
+
+    assert single_layer.shape == (1, 8)
+    assert two_layers.shape == (1, 16)  # 2 layers * d_model=8
+    np.testing.assert_allclose(two_layers[:, :8], single_layer, rtol=1e-5, atol=1e-6)
 
 
 def _make_df_with_shape(pattern: str, n: int = 20) -> pd.DataFrame:
