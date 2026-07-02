@@ -355,6 +355,64 @@ Benchmark ^TWII：Sharpe=1.47，Ann=41.24%
 
 ---
 
+## Round 6 — 2026-07-02（Kronos Embedding + XGBoost LambdaRankIC，M1）
+
+**起點：** `NeoQuasar/Kronos-base`（**完全凍結，從未 fine-tune**）
+**平台：** RunPod A40 48GB（SECURE cloud, $0.44/hr）
+**Branch：** `research/round-6-m1-embedding`
+**Plan：** `docs/superpowers/plans/2026-07-02-kronos-embedding-xgb-lambdarank.md`
+
+**戰略背景：** Round 1–5 全部證實「fine-tune Kronos-base」這條路系統性失敗（文獻 arXiv:2511.18578 佐證：pretrained TSFM 在金融回報預測的 fine-tuning 情境下架構性失敗，不是超參數問題）。M1 改用完全不同的路徑：**凍結 Kronos，只當特徵抽取器，用 XGBoost 在其 hidden state 上直接學排序**，理論上繞開 catastrophic forgetting 與 fine-tuning 退化問題。
+
+**驗證的方法：**
+- ✅ **凍結 embedding 抽取**：`extract_embeddings.py`，mean-pool 最後一層 hidden state（Kronos-base 實際 `d_model=832`），加上 4 個 raw 技術指標（MA5/MA20 distance, 10日動量, volume ratio）
+- ✅ **LambdaRankIC objective**：自行推導的 LambdaRank pairwise 目標函數，用 label rank 距離取代標準 LambdaRank 的 NDCG gain 項，逼近直接優化 Spearman Rank-IC（非逐字照抄 arXiv:2605.00501，是我方推導）
+- ✅ **全母體驗證**：不像 Round 0-5 用抽樣驗證集（150-500 symbols），這裡驗證集是完整 130 天 × ~1039 檔股票，噪音低很多
+
+**資料規模：**
+- 訓練集：2015-01-01 → 2023-12-31，2,141,404 筆（2246 個交易日 × ~1039 檔股票）
+- 驗證集：2024-01-01 → 2024-06-30，135,323 筆
+- 測試集：2024-07-01 → 2026-07-02（97 個訊號日，hold=5d 間隔）
+
+**工程筆記（重要，供未來大規模跑類似任務參考）：**
+1. `extract_embeddings.py` 逐日迴圈是 **CPU 單執行緒瓶頸**，GPU 使用率 0%——改成把日期切成多段、各自獨立 CLI process 平行跑，GPU 衝到 100%，速度提升近 8 倍
+2. 8-way 平行會撞到 pod 的 **50GB RAM cgroup 上限**（container 裡 `top`/`free` 看不出真實上限，需查 `/sys/fs/cgroup/memory/memory.limit_in_bytes`），單一 worker 隨進度累積記憶體可達 25GB。改成切更細（每段再折半）+ 3 併發才穩定
+3. XGBoost 訓練階段 `pd.read_parquet` 讀 11GB 的合併訓練集會**膨脹到 42.7GB**（近 4 倍），逼近上限——改用 `pyarrow.ParquetFile.iter_batches()` 串流讀取到預先配置好的 numpy array，避開 pandas 整表 materialize 的記憶體開銷
+4. 詳細記錄於 memory `runpod_training.md`
+
+### 訓練歷程（XGBoost，非 epoch 制）
+
+| Round | val-rank_ic | 備注 |
+|-------|------------|------|
+| 0 | 0.0406 | |
+| 50 | 0.0568 | |
+| 100 | 0.0631 | |
+| **190** | **0.0665** | ← **Best（best_iteration=190）** |
+| 199 | 0.0663 | 訓練上限（num_boost_round=200），early stop 未觸發 |
+
+驗證集 IC 全程單調上升（僅 round 140 有一次微幅回落），最終 val-rank_ic ≈ 0.066——**顯著高於 Round 0-5 在 h5 量到的 IC**（Pretrained 0.0268、Round 0 0.0319、Round 5 val_ic ~0.02-0.03），且因為是全母體計算，統計上比抽樣估計可信得多。
+
+### 回測結果（open/open v2，top_k=10，hold=5d）
+
+| 指標 | Round 6 (M1) | Round 0（基準 1.12） | 差距 |
+|------|-------------|---------------------|------|
+| **Sharpe** | **0.340** | **1.12** | **−0.78** |
+| **Ann** | **5.52%** | **38.59%** | **−33.1%** |
+| **MaxDD** | 30.29% | 35.03% | +4.7%（略優）|
+
+### 失敗分析
+
+1. **驗證集 IC 高 ≠ 回測表現好**：這是 Round 5 已經出現過的模式（val ic_ir_h5=0.47 但 Sharpe 只有 0.98）在 M1 上再次重演，而且這次落差更大——0.066 的 IC（全母體、低噪音）卻只換來 0.34 的 Sharpe。說明「驗證集截面排序能力」跟「可執行策略的實際獲利能力」之間存在系統性落差，不是抽樣噪音能解釋的
+2. **凍結 embedding 假設未獲支持**：M1 的核心假設——「Kronos-base 的中間層表徵本身含有足夠的排序資訊，只是 autoregressive head 沒把它轉化出來」——沒有在這次實驗中得到驗證。可能的原因：(a) Kronos-base 預訓練階段本身就沒有學到跟台股報酬相關的表徵（跨市場、跨資產類別的通用預訓練，未必包含台股特定的截面訊號）；(b) mean-pooling 整個 lookback window 可能把有用的時間局部訊號平均掉了；(c) LambdaRankIC 目標函數是自行推導、非原論文逐字實作，可能還有調參空間（`sigma`、gain 函數形式）
+3. **技術指標特徵可能貢獻有限**：目前無法從單一模型結果拆解 embedding vs. raw features 各自的貢獻，`layer_indices` 消融（Task 6 已實作但未在此輪測試）跟純 raw-feature-only 對照組都還沒跑
+
+**參考資料：**
+- `docs/superpowers/plans/2026-07-02-kronos-embedding-xgb-lambdarank.md`
+- `finetune_tw/extract_embeddings.py`, `finetune_tw/lambdarank_ic.py`, `finetune_tw/train_xgb_lambdarank.py`, `finetune_tw/backtest_xgb_embedding.py`
+- `finetune_tw/outputs/tw_daily/backtest_returns_xgb_embedding_next_open.json`
+
+---
+
 ## 各輪 Sharpe 彙整（open/open v2，top_k=10，hold=5d）
 
 | 版本 | Sharpe | Ann | MaxDD | 備注 |
@@ -366,6 +424,7 @@ Benchmark ^TWII：Sharpe=1.47，Ann=41.24%
 | Round 3 | 0.50 | 20% | 41% | open IC，大幅退步 |
 | Round 4 | 1.24 | 46% | 34% | FPT + IC-IR@h1，輸 Round 0 |
 | Round 5 | 0.98 | 31.79% | 39.86% | Pretrained 重啟 + Ranking Loss，仍輸 Round 0 |
+| Round 6 | 0.34 | 5.52% | 30.29% | Kronos Embedding + XGBoost LambdaRankIC（M1），大幅退步，驗證集IC高但不轉化 |
 
 ---
 
@@ -373,7 +432,7 @@ Benchmark ^TWII：Sharpe=1.47，Ann=41.24%
 
 **Round 0 仍是目前唯一可執行的版本（Sharpe 1.12，新基準）。**
 
-已窮盡所有已知方向（截至 2026-07-01）：
+已窮盡所有已知方向（截至 2026-07-02）：
 - 重訓（Round 1-5）：全部退步，Round 0 是目前上限
 - 策略參數（ATR sizing、volume filter）：no-op
 - Stacking / MC ensemble：有害
@@ -381,8 +440,18 @@ Benchmark ^TWII：Sharpe=1.47，Ann=41.24%
 - Label Horizon 掃描：IC-IR 從 h=1 單調衰減，換 hold_days 無效
 - FPT freeze（Round 4）：best epoch=1
 - Pretrained 重啟 + Auxiliary Ranking Loss（Round 5）：Sharpe 0.98，退步
+- **凍結 Kronos + XGBoost LambdaRankIC（Round 6 / M1）：Sharpe 0.34，大幅退步**——「跳過 fine-tuning，改用凍結表徵」這個原本被寄予厚望的全新方向，也沒有打贏 Round 0
 
-**若要繼續提升，可考慮的未驗證方向：**
+**Round 6 之後的思考：** 連續兩輪（Round 5、Round 6）都出現「驗證集指標創新高，但回測 Sharpe 不升反降」的模式，且用的是完全不同的方法（一個是 fine-tuning + ranking loss，一個是凍結 embedding + XGBoost）。這暗示問題可能不在「用哪種訓練方法」，而在更根本的地方：
+1. **驗證集跟回測的評估基準本身有落差**——即使 Round 6 已經改成全母體驗證（非抽樣），落差依然巨大，說明「驗證集低噪音」不是關鍵，可能是驗證集的時間窗口（訓練/驗證/測試切分）跟實際部署情境有系統性差異
+2. **可能需要先做小規模、可控的診斷實驗**，而不是每次都直接上大規模訓練——例如先驗證「驗證集 IC 排序」是否至少方向上跟「测試期同一批股票同一批日期的實際排序」一致，抓出斷點在哪一步
+
+**未驗證的 M1 後續方向（若要繼續走這個路線）：**
+1. **Round 0 embedding 對照**：用已經 fine-tune 過的 Round 0 權重（而非 pretrained）當凍結特徵抽取器，看 fine-tuned 表徵是否比原始 pretrained 表徵更適合當特徵——這是本輪結束前討論過、保留到看到 pretrained 結果才決定的實驗，現在 pretrained 已經明確輸了，這個對照的意義變成「M1 這條路本身還有沒有救」而非「哪個起點更好」
+2. **`layer_indices` 消融**（Task 6 已實作，未測試）：改用中間層而非最後一層的 hidden state，看是否有更適合排序任務的表徵
+3. **Raw-feature-only 對照組**：拿掉 Kronos embedding，只用 4 個技術指標訓練 XGBoost，確認 embedding 到底有沒有正貢獻，還是技術指標在背後撐著
+
+**若要回到 fine-tuning 路線，可考慮的未驗證方向：**
 1. **更大的驗證集 + 更長訓練**：val 集 150×40 可能太小，導致 ic_ir 估計噪音大、early stop 不穩定
 2. **Ranking loss 調參**：`ranking_loss_alpha` 從 0.1 調低（如 0.01），減少對 token prediction 的干擾
 3. **不同 ranking loss 形式**：ListMLE vs. pairwise hinge loss；或直接在 test set dates 上對齊 oracle
@@ -408,6 +477,7 @@ Benchmark ^TWII：Sharpe=1.47，Ann=41.24%
 | Extended Warmup（pct=0.08, div=25）| 260629 M3 | Round 4 | ❌ 對退化無效 |
 | Stacking（LightGBM，MC=5/10）| — | 獨立實驗 | ❌ 有害（-0.20 Sharpe），已移除 |
 | MC ensemble（mc_mean）| — | 獨立實驗 | ❌ 有害（Sharpe 1.07 < benchmark 1.60）|
+| Kronos Embedding + XGBoost LambdaRankIC（凍結 Kronos，繞開 fine-tuning）| 260701 M1 | Round 6 | ❌ val-rank_ic 創新高（0.066，全母體）但 Sharpe 僅 0.34，大幅退步，跟 Round 5 一樣的「驗證集指標好但不轉化」模式 |
 
 ### 未驗證（autoresearch 有記錄，從未測試）
 
